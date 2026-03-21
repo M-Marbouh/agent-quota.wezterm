@@ -88,7 +88,12 @@ local function deep_merge(t1, t2)
 end
 
 local function current_file_path()
-  local info = debug.getinfo(1, "S")
+  local dbg = rawget(_G, "debug")
+  if type(dbg) ~= "table" or type(dbg.getinfo) ~= "function" then
+    return nil
+  end
+
+  local info = dbg.getinfo(1, "S")
   local source = info and info.source or nil
   if type(source) == "string" and source:sub(1, 1) == "@" then
     return source:sub(2)
@@ -116,17 +121,60 @@ local function file_exists(path)
 end
 
 local function resolve_codex_script()
+  local home = os.getenv("HOME") or ""
   local plugin_dir = dirname(current_file_path())
   local candidates = {}
+
+  local env_path = os.getenv("WEZTERM_AGENT_QUOTA_CODEX_HELPER")
+  if env_path and env_path ~= "" then
+    candidates[#candidates + 1] = env_path
+  end
 
   if plugin_dir then
     candidates[#candidates + 1] = plugin_dir .. "/../codex-limits.py"
     candidates[#candidates + 1] = plugin_dir .. "/codex-limits.py"
   end
 
+  if home ~= "" then
+    candidates[#candidates + 1] = home .. "/.local/share/wezterm/codex-limits.py"
+    candidates[#candidates + 1] = home .. "/dev/Plugins/agent-quota.wezterm/codex-limits.py"
+    candidates[#candidates + 1] = home .. "/dev/Plugins/wezterm-quota-limit/codex-limits.py"
+  end
+
   for _, candidate in ipairs(candidates) do
     if file_exists(candidate) then
       return candidate
+    end
+  end
+
+  if home ~= "" then
+    local plugins_dir = home .. "/.local/share/wezterm/plugins"
+    local ok, stdout = wezterm.run_child_process({
+      "find",
+      plugins_dir,
+      "-maxdepth",
+      "5",
+      "-type",
+      "f",
+      "-name",
+      "codex-limits.py",
+    })
+
+    if ok and stdout and stdout ~= "" then
+      local selected = nil
+      for line in stdout:gmatch("[^\r\n]+") do
+        if not selected then
+          selected = line
+        end
+        if line:find("agent%-quota%.wezterm", 1, false) then
+          selected = line
+          break
+        end
+      end
+
+      if selected and file_exists(selected) then
+        return selected
+      end
     end
   end
 

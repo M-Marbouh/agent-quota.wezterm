@@ -131,6 +131,7 @@ Status display:
 - Claude shows `not running`: confirm `pgrep -x claude` returns a process.
 - Codex shows `not running`: open Codex in a WezTerm pane and keep that pane alive; detection uses WezTerm pane process info.
 - Codex helper fails in a GUI PATH environment: run `python3 codex-limits.py` directly; the helper auto-discovers common `nvm` installs.
+- Codex helper path resolution fails in a custom environment: set `WEZTERM_AGENT_QUOTA_CODEX_HELPER=/absolute/path/to/codex-limits.py` before launching WezTerm.
 - Cached data looks stale: inspect or remove `/tmp/wezterm-quota-limit-"$USER"-*.json` and reload WezTerm.
 - Codex helper is missing: ensure the full plugin repo was installed, not just `plugin/init.lua` by itself.
 

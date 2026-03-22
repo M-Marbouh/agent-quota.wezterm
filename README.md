@@ -107,6 +107,7 @@ Claude:
 - reads the OAuth token from `~/.claude/.credentials.json`
 - calls the Anthropic OAuth usage endpoint
 - preserves stale data and backs off on repeated errors
+- stops trusting stale data once a reported reset boundary has already passed, and briefly shows `syncing...` until fresh data arrives
 
 Codex:
 

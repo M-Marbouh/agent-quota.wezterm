@@ -223,6 +223,7 @@ local CLAUDE_LOCK_DIR = SHARED_CACHE_PREFIX .. "-claude.lock"
 local CODEX_CACHE_PATH = SHARED_CACHE_PREFIX .. "-codex.json"
 local CODEX_LOCK_DIR = SHARED_CACHE_PREFIX .. "-codex.lock"
 local LOCK_TIMEOUT_SECS = 30
+local INVALID_STALE_RETRY_SECS = 15
 
 local function json_escape(str)
   local replacements = {
@@ -360,13 +361,78 @@ local function read_shared_cache(path)
   return entry
 end
 
+local function unix_from_iso_utc(reset_str)
+  if type(reset_str) ~= "string" or reset_str == "" then
+    return nil
+  end
+
+  local year, month, day, hour, min, sec =
+    reset_str:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+  if not year then
+    return nil
+  end
+
+  local local_ts = os.time({
+    year = tonumber(year),
+    month = tonumber(month),
+    day = tonumber(day),
+    hour = tonumber(hour),
+    min = tonumber(min),
+    sec = tonumber(sec),
+  })
+
+  local now_local = os.time()
+  local now_utc = os.time(os.date("!*t", now_local))
+  return local_ts - (now_utc - now_local)
+end
+
+local function earliest_reset_boundary_ts(data)
+  if type(data) ~= "table" or data.not_running or data.error or data.syncing then
+    return nil
+  end
+
+  local candidates = {}
+
+  local five_reset = data.five_hour and unix_from_iso_utc(data.five_hour.resets_at) or nil
+  local seven_reset = data.seven_day and unix_from_iso_utc(data.seven_day.resets_at) or nil
+  local primary_reset = tonumber(data.primary_reset_at)
+  local secondary_reset = tonumber(data.secondary_reset_at)
+
+  if five_reset then
+    candidates[#candidates + 1] = five_reset
+  end
+  if seven_reset then
+    candidates[#candidates + 1] = seven_reset
+  end
+  if primary_reset then
+    candidates[#candidates + 1] = primary_reset
+  end
+  if secondary_reset then
+    candidates[#candidates + 1] = secondary_reset
+  end
+
+  if #candidates == 0 then
+    return nil
+  end
+
+  table.sort(candidates)
+  return candidates[1]
+end
+
+local function data_crossed_reset_boundary(data, now)
+  local reset_at = earliest_reset_boundary_ts(data)
+  return reset_at ~= nil and now >= reset_at
+end
+
 local function shared_cache_is_fresh(entry, now)
   if type(entry) ~= "table" or type(entry.data) ~= "table" then
     return false
   end
 
   local next_refresh_at = tonumber(entry.next_refresh_at)
-  return next_refresh_at ~= nil and now < next_refresh_at
+  return next_refresh_at ~= nil
+    and now < next_refresh_at
+    and not data_crossed_reset_boundary(entry.data, now)
 end
 
 local function interval_for_errors(error_count)
@@ -377,10 +443,10 @@ local function interval_for_errors(error_count)
   return math.min(120 * (2 ^ (error_count - 1)), 1800)
 end
 
-local function build_cache_entry(data, error_count, last_err, now)
+local function build_cache_entry(data, error_count, last_err, now, retry_secs)
   return {
     written_at = now,
-    next_refresh_at = now + interval_for_errors(error_count),
+    next_refresh_at = now + (retry_secs or interval_for_errors(error_count)),
     error_count = error_count,
     last_error = last_err,
     data = data,
@@ -420,11 +486,28 @@ local function release_lock(lock_dir)
   wezterm.run_child_process({ "rmdir", lock_dir })
 end
 
-local function cacheable_data(data)
-  if type(data) ~= "table" or data.not_running then
+local function cacheable_data(data, now)
+  if type(data) ~= "table" or data.not_running or data.syncing then
+    return nil
+  end
+  if now and data_crossed_reset_boundary(data, now) then
     return nil
   end
   return data
+end
+
+local function transient_refresh_entry(previous_data, previous_errors, last_err, now, raw_previous)
+  if data_crossed_reset_boundary(raw_previous, now) then
+    return build_cache_entry(
+      { syncing = true },
+      previous_errors + 1,
+      last_err,
+      now,
+      INVALID_STALE_RETRY_SECS
+    )
+  end
+
+  return build_cache_entry(previous_data or { error = last_err }, previous_errors + 1, last_err, now)
 end
 
 -- ============================================================
@@ -654,7 +737,8 @@ local function fetch_codex_limits(window, pane)
     return locked_cache.data
   end
 
-  local previous_data = cacheable_data((locked_cache and locked_cache.data) or codex_cached)
+  local raw_previous = (locked_cache and locked_cache.data) or codex_cached
+  local previous_data = cacheable_data(raw_previous, now)
   local previous_errors = tonumber(locked_cache and locked_cache.error_count) or codex_errors or 0
 
   -- Query Codex rate limits via the helper script
@@ -663,32 +747,34 @@ local function fetch_codex_limits(window, pane)
 
   if raw == "" then
     local err = (stderr and stderr ~= "") and stderr or "codex helper failed"
-    entry = build_cache_entry(previous_data or { error = err }, previous_errors + 1, err, now)
+    entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
   else
     local ok, data = pcall(wezterm.json_parse, raw)
 
     if not ok or not data then
       local err = (stderr and stderr ~= "") and stderr or "codex helper parse failed"
-      entry = build_cache_entry(previous_data or { error = err }, previous_errors + 1, err, now)
+      entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
     elseif data.error then
       local err = tostring(data.error)
-      entry = build_cache_entry(previous_data or { error = err }, previous_errors + 1, err, now)
+      entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
     elseif not success then
       local err = (stderr and stderr ~= "") and stderr or "codex helper failed"
-      entry = build_cache_entry(previous_data or { error = err }, previous_errors + 1, err, now)
+      entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
     else
       local primary = data.rateLimits and data.rateLimits.primary
       local secondary = data.rateLimits and data.rateLimits.secondary
 
       if not primary then
         local err = "no rate limit data"
-        entry = build_cache_entry(previous_data or { error = err }, previous_errors + 1, err, now)
+        entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
       else
         entry = build_cache_entry({
           primary_pct = primary.usedPercent,
           primary_reset = time_until_unix(primary.resetsAt),
+          primary_reset_at = primary.resetsAt,
           secondary_pct = secondary and secondary.usedPercent or nil,
           secondary_reset = secondary and time_until_unix(secondary.resetsAt) or nil,
+          secondary_reset_at = secondary and secondary.resetsAt or nil,
           primary_mins = primary.windowDurationMins,
         }, 0, nil, now)
       end
@@ -893,13 +979,14 @@ local function fetch_usage()
     return locked_cache.data
   end
 
-  local previous_data = cacheable_data((locked_cache and locked_cache.data) or cached_data)
+  local raw_previous = (locked_cache and locked_cache.data) or cached_data
+  local previous_data = cacheable_data(raw_previous, now)
   local previous_errors = tonumber(locked_cache and locked_cache.error_count) or consecutive_errors or 0
 
   -- Re-read token from disk each fetch — Claude Code may have refreshed it
   local token, expires_at, err = get_token()
   if not token then
-    entry = build_cache_entry(previous_data or { error = err }, previous_errors + 1, err, now)
+    entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
   else
     -- If the token changed on disk (Claude Code refreshed it), reset error state
     if cached_token and token ~= cached_token then
@@ -912,12 +999,12 @@ local function fetch_usage()
     local now_ms = math.floor(now * 1000)
     if expires_at and now_ms >= expires_at then
       local token_err = "token expired — waiting for Claude Code"
-      entry = build_cache_entry(previous_data or { error = token_err }, previous_errors + 1, token_err, now)
+      entry = transient_refresh_entry(previous_data, previous_errors, token_err, now, raw_previous)
     else
       local body, status, curl_err = call_usage_api(token)
 
       if curl_err then
-        entry = build_cache_entry(previous_data or { error = curl_err }, previous_errors + 1, curl_err, now)
+        entry = transient_refresh_entry(previous_data, previous_errors, curl_err, now, raw_previous)
       elseif status == 429 then
         local next_errors = previous_errors + 1
         local wait = interval_for_errors(next_errors)
@@ -925,15 +1012,15 @@ local function fetch_usage()
         entry = build_cache_entry(previous_data or { error = rate_err }, next_errors, rate_err, now)
       elseif status == 401 or status == 403 then
         local auth_err = "auth failed — waiting for Claude Code"
-        entry = build_cache_entry(previous_data or { error = auth_err }, previous_errors + 1, auth_err, now)
+        entry = transient_refresh_entry(previous_data, previous_errors, auth_err, now, raw_previous)
       else
         local ok, data = pcall(wezterm.json_parse, body)
         if not ok or not data then
           local parse_err = "parse failed"
-          entry = build_cache_entry(previous_data or { error = parse_err }, previous_errors + 1, parse_err, now)
+          entry = transient_refresh_entry(previous_data, previous_errors, parse_err, now, raw_previous)
         elseif data.error then
           local api_err = data.error.message or "api error"
-          entry = build_cache_entry(previous_data or { error = api_err }, previous_errors + 1, api_err, now)
+          entry = transient_refresh_entry(previous_data, previous_errors, api_err, now, raw_previous)
         else
           entry = build_cache_entry(data, 0, nil, now)
         end
@@ -960,6 +1047,8 @@ local function build_status_string(data, window, pane)
   local claude_str
   if data.not_running then
     claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "not running"
+  elseif data.syncing then
+    claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "syncing..."
   elseif data.error then
     claude_str = DIM .. " ⚡ Claude: "
       .. hex_to_fg("#f7768e") .. tostring(data.error)
@@ -996,6 +1085,8 @@ local function build_status_string(data, window, pane)
 
   if cd.not_running then
     codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
+  elseif cd.syncing then
+    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "syncing..."
 
   elseif cd.ready then
     codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. hex_to_fg("#9ece6a") .. "ready"

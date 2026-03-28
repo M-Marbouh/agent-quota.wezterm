@@ -587,123 +587,22 @@ local function time_until_unix(ts)
   return string.format("%dd%dh", math.floor(diff / 86400), math.floor((diff % 86400) / 3600))
 end
 
-local function basename(path)
-  if not path or path == "" then
-    return nil
-  end
-  return path:gsub("(.*[/\\])(.*)", "%2")
+-- Returns true if an interactive Codex session (tty-attached, not VS Code app-server daemon) is running.
+-- Uses ps rather than /proc to work reliably in WezTerm's GUI subprocess environment.
+-- Used only as a display hint — never gates quota fetching.
+local function is_codex_running()
+  local ok, stdout = wezterm.run_child_process({
+    "sh", "-c",
+    "ps -eo comm=,tty= | grep '^codex ' | grep -qv ' ?$' && echo yes",
+  })
+  return ok and stdout ~= nil and stdout:find("yes", 1, true) ~= nil
 end
 
-local function proc_info_looks_like_codex(proc)
-  if not proc then
-    return false
-  end
-
-  local exe = basename(proc.executable)
-  if exe then
-    exe = exe:lower()
-    if exe == "codex" or exe == "codex.js" or exe == "cli.js" then
-      return true
-    end
-  end
-
-  local argv = proc.argv or {}
-  for _, arg in ipairs(argv) do
-    local lower = tostring(arg):lower()
-    if lower:match("(^|/)codex$") or lower:match("/codex%.js$") or lower:match("/cli%.js$") then
-      return true
-    end
-    if lower:find("@openai/codex", 1, true) then
-      return true
-    end
-  end
-
-  local children = proc.children or {}
-  for _, child in pairs(children) do
-    if proc_info_looks_like_codex(child) then
-      return true
-    end
-  end
-
-  return false
-end
-
-local function pane_looks_like_codex(pane)
-  if not pane then
-    return false
-  end
-
-  local proc_info = pane.get_foreground_process_info and pane:get_foreground_process_info() or nil
-  if proc_info and proc_info_looks_like_codex(proc_info) then
-    return true
-  end
-
-  local proc_name = pane.get_foreground_process_name and pane:get_foreground_process_name() or nil
-  local exe = basename(proc_name)
-  if exe then
-    exe = exe:lower()
-  end
-  if exe == "codex" or exe == "codex.js" or exe == "cli.js" then
-    return true
-  end
-
-  local title = pane.get_title and pane:get_title() or ""
-  if title:lower():find("openai codex", 1, true) then
-    return true
-  end
-
-  return false
-end
-
-local function mux_window_has_codex(mux_window)
-  if not mux_window or not mux_window.tabs_with_info then
-    return false
-  end
-
-  for _, tab_info in ipairs(mux_window:tabs_with_info()) do
-    local tab = tab_info.tab
-    if tab and tab.panes_with_info then
-      for _, pane_info in ipairs(tab:panes_with_info()) do
-        if pane_looks_like_codex(pane_info.pane) then
-          return true
-        end
-      end
-    end
-  end
-
-  return false
-end
-
--- Check whether any local WezTerm pane is running Codex
-local function is_codex_running(window, pane)
-  if pane_looks_like_codex(pane) then
-    return true
-  end
-
-  if wezterm.mux and wezterm.mux.all_windows then
-    for _, mux_window in ipairs(wezterm.mux.all_windows()) do
-      if mux_window_has_codex(mux_window) then
-        return true
-      end
-    end
-  end
-
-  if window and window.mux_window then
-    return mux_window_has_codex(window:mux_window())
-  end
-
-  return false
-end
-
-local function fetch_codex_limits(window, pane)
+local function fetch_codex_limits()
   local now = os.time()
 
-  if not is_codex_running(window, pane) then
-    codex_cached = { not_running = true }
-    codex_errors = 0
-    codex_last_error = nil
-    return codex_cached
-  end
+  -- No running gate: quota is account-level and always fetchable.
+  -- is_codex_running() is used only in the display layer as an activity hint.
 
   if not file_exists(CODEX_SCRIPT) then
     codex_cached = { error = "missing bundled codex helper" }
@@ -712,7 +611,23 @@ local function fetch_codex_limits(window, pane)
     return codex_cached
   end
 
+  -- Read shared cache, but discard it if it contains stale not-running data
+  -- (written during a period when detection failed but Codex was actually running)
   local shared = read_shared_cache(CODEX_CACHE_PATH)
+  if shared and type(shared.data) == "table" then
+    local d = shared.data
+    -- Only clear the old boolean not_running flag (written by a previous code version).
+    -- The string error "not running" is legitimate output from codex app-server and
+    -- must be respected with its backoff — do not clear it here.
+    if d.not_running then
+      os.remove(CODEX_CACHE_PATH)
+      shared = nil
+      codex_cached = nil
+      codex_errors = 0
+      codex_last_error = nil
+    end
+  end
+
   sync_codex_shared_state(shared)
 
   if shared_cache_is_fresh(shared, now) then
@@ -756,7 +671,13 @@ local function fetch_codex_limits(window, pane)
       entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
     elseif data.error then
       local err = tostring(data.error)
-      entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
+      if err == "not running" then
+        -- Codex app-server reports "not running" when no session is active.
+        -- This is expected; use a short retry (30s) and don't escalate the error count.
+        entry = build_cache_entry({ error = err }, 0, err, now, 30)
+      else
+        entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
+      end
     elseif not success then
       local err = (stderr and stderr ~= "") and stderr or "codex helper failed"
       entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
@@ -939,7 +860,6 @@ local function call_usage_api(token)
   return body, tonumber(http_code), nil
 end
 
--- Check if Claude Code process is running
 local function is_claude_running()
   local ok, stdout = wezterm.run_child_process({ "pgrep", "-x", "claude" })
   return ok and stdout and stdout:match("%d") ~= nil
@@ -1081,10 +1001,15 @@ local function build_status_string(data, window, pane)
 
   -- ── Codex ───────────────────────────────────────────────
   local codex_str
-  local cd = fetch_codex_limits(window, pane)
+  local cd = fetch_codex_limits()
+  local codex_active = is_codex_running()
 
-  if cd.not_running then
-    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
+  if cd.error == "not running" then
+    if codex_active then
+      codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "loading..."
+    else
+      codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
+    end
   elseif cd.syncing then
     codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "syncing..."
 
@@ -1122,8 +1047,11 @@ local function build_status_string(data, window, pane)
       end
     end
 
+  elseif codex_active then
+    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "loading..."
+
   else
-    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. hex_to_fg("#e0af68") .. "no data"
+    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
   end
 
   -- ── Join with separator ──────────────────────────────────

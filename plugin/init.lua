@@ -13,7 +13,7 @@ local config = {
   },
   bars = {
     enabled = true,
-    width = 6,
+    width = 8,
     full = "█",
     empty = "░",
   },
@@ -203,6 +203,8 @@ local function usage_bar_esc(pct)
   local filled = math.floor((normalized / 100) * width + 0.5)
   if normalized >= 100 then
     filled = width
+  elseif normalized > 0 and filled == 0 then
+    filled = 1
   elseif normalized <= 0 then
     filled = 0
   end

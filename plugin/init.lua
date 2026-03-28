@@ -1009,12 +1009,11 @@ local function build_status_string(data, window, pane)
   local cd = fetch_codex_limits()
   local codex_active = is_codex_running()
 
-  if cd.error == "not running" then
-    if codex_active then
-      codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "loading..."
-    else
-      codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
-    end
+  if not codex_active then
+    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
+
+  elseif cd.error == "not running" then
+    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "loading..."
   elseif cd.syncing then
     codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "syncing..."
 
@@ -1052,11 +1051,8 @@ local function build_status_string(data, window, pane)
       end
     end
 
-  elseif codex_active then
-    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "loading..."
-
   else
-    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"
+    codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "loading..."
   end
 
   -- ── Join with separator ──────────────────────────────────

@@ -936,7 +936,11 @@ local function fetch_usage()
         local next_errors = previous_errors + 1
         local wait = interval_for_errors(next_errors)
         local rate_err = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
-        entry = build_cache_entry(previous_data or { error = rate_err }, next_errors, rate_err, now)
+        if previous_data then
+          entry = build_cache_entry(previous_data, next_errors, rate_err, now)
+        else
+          entry = transient_refresh_entry(previous_data, previous_errors, rate_err, now, raw_previous)
+        end
       elseif status == 401 or status == 403 then
         local auth_err = "auth failed — waiting for Claude Code"
         entry = transient_refresh_entry(previous_data, previous_errors, auth_err, now, raw_previous)

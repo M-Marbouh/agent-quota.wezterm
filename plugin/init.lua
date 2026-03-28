@@ -136,9 +136,9 @@ local function resolve_codex_script()
   end
 
   if home ~= "" then
-    candidates[#candidates + 1] = home .. "/.local/share/wezterm/codex-limits.py"
-    candidates[#candidates + 1] = home .. "/dev/Plugins/agent-quota.wezterm/codex-limits.py"
     candidates[#candidates + 1] = home .. "/dev/Plugins/wezterm-quota-limit/codex-limits.py"
+    candidates[#candidates + 1] = home .. "/dev/Plugins/agent-quota.wezterm/codex-limits.py"
+    candidates[#candidates + 1] = home .. "/.local/share/wezterm/codex-limits.py"
   end
 
   for _, candidate in ipairs(candidates) do
@@ -600,6 +600,7 @@ end
 
 local function fetch_codex_limits()
   local now = os.time()
+  local codex_active = is_codex_running()
 
   -- No running gate: quota is account-level and always fetchable.
   -- is_codex_running() is used only in the display layer as an activity hint.
@@ -631,7 +632,9 @@ local function fetch_codex_limits()
   sync_codex_shared_state(shared)
 
   if shared_cache_is_fresh(shared, now) then
-    return shared.data
+    if not (codex_active and type(shared.data) == "table" and shared.data.error == "not running") then
+      return shared.data
+    end
   end
 
   if not acquire_lock(CODEX_LOCK_DIR) then
@@ -648,8 +651,10 @@ local function fetch_codex_limits()
   sync_codex_shared_state(locked_cache)
 
   if shared_cache_is_fresh(locked_cache, now) then
-    release_lock(CODEX_LOCK_DIR)
-    return locked_cache.data
+    if not (codex_active and type(locked_cache.data) == "table" and locked_cache.data.error == "not running") then
+      release_lock(CODEX_LOCK_DIR)
+      return locked_cache.data
+    end
   end
 
   local raw_previous = (locked_cache and locked_cache.data) or codex_cached
@@ -860,21 +865,19 @@ local function call_usage_api(token)
   return body, tonumber(http_code), nil
 end
 
--- Returns true if an interactive Claude session (tty-attached) is running.
--- Uses ps rather than /proc to work reliably in WezTerm's GUI subprocess environment.
 local function is_claude_running()
-  local ok, stdout = wezterm.run_child_process({
-    "sh", "-c",
-    "ps -eo comm=,tty= | grep '^claude ' | grep -qv ' ?$' && echo yes",
-  })
-  return ok and stdout ~= nil and stdout:find("yes", 1, true) ~= nil
+  local ok, stdout = wezterm.run_child_process({ "pgrep", "-x", "claude" })
+  return ok and stdout and stdout:match("%d") ~= nil
 end
 
 -- Fetch usage data (synchronous curl call cached at the polling interval)
--- No running gate: quota is account-level and always fetchable.
--- is_claude_running() is used only in the display layer as an activity hint.
 local function fetch_usage()
   local now = os.time()
+
+  -- Always check process state first — never show stale data when Claude is closed
+  if not is_claude_running() then
+    return { not_running = true }
+  end
 
   local shared = read_shared_cache(CLAUDE_CACHE_PATH)
   sync_claude_shared_state(shared)
@@ -966,22 +969,15 @@ local DASHBOARD_URL = "https://console.anthropic.com/settings/usage"
 -- Build status string using raw ANSI escapes (avoids wezterm.format deserialization issues)
 local function build_status_string(data, window, pane)
   -- ── Claude ──────────────────────────────────────────────
-  local claude_active = is_claude_running()
-  local has_claude_data = type(data.five_hour) == "table" or type(data.seven_day) == "table"
   local claude_str
-  if data.syncing then
+  if data.not_running then
+    claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "not running"
+  elseif data.syncing then
     claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "syncing..."
-  elseif has_claude_data then
-    -- fall through to quota display below (shown regardless of running state)
   elseif data.error then
     claude_str = DIM .. " ⚡ Claude: "
       .. hex_to_fg("#f7768e") .. tostring(data.error)
-  elseif claude_active then
-    claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "loading..."
   else
-    claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "not running"
-  end
-  if not claude_str then
     local five_pct   = data.five_hour and data.five_hour.utilization or 0
     local five_reset = data.five_hour and data.five_hour.resets_at
     local seven_pct  = data.seven_day and data.seven_day.utilization or 0

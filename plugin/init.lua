@@ -226,6 +226,7 @@ local CODEX_CACHE_PATH = SHARED_CACHE_PREFIX .. "-codex.json"
 local CODEX_LOCK_DIR = SHARED_CACHE_PREFIX .. "-codex.lock"
 local LOCK_TIMEOUT_SECS = 30
 local INVALID_STALE_RETRY_SECS = 15
+local CLAUDE_RATE_LIMIT_RETRY_SECS = 60
 
 local function json_escape(str)
   local replacements = {
@@ -426,12 +427,20 @@ local function data_crossed_reset_boundary(data, now)
   return reset_at ~= nil and now >= reset_at
 end
 
+local function is_rate_limited_error(err)
+  return type(err) == "string" and err:match("^rate limited") ~= nil
+end
+
 local function shared_cache_is_fresh(entry, now)
   if type(entry) ~= "table" or type(entry.data) ~= "table" then
     return false
   end
 
   local next_refresh_at = tonumber(entry.next_refresh_at)
+  if is_rate_limited_error(entry.data.error) then
+    local written_at = tonumber(entry.written_at) or now
+    next_refresh_at = math.min(next_refresh_at or (written_at + CLAUDE_RATE_LIMIT_RETRY_SECS), written_at + CLAUDE_RATE_LIMIT_RETRY_SECS)
+  end
   return next_refresh_at ~= nil
     and now < next_refresh_at
     and not data_crossed_reset_boundary(entry.data, now)
@@ -937,9 +946,9 @@ local function fetch_usage()
         local wait = interval_for_errors(next_errors)
         local rate_err = string.format("rate limited (retry in %dm)", math.ceil(wait / 60))
         if previous_data then
-          entry = build_cache_entry(previous_data, next_errors, rate_err, now)
+          entry = build_cache_entry(previous_data, next_errors, rate_err, now, CLAUDE_RATE_LIMIT_RETRY_SECS)
         else
-          entry = transient_refresh_entry(previous_data, previous_errors, rate_err, now, raw_previous)
+          entry = build_cache_entry({ syncing = true }, next_errors, rate_err, now, CLAUDE_RATE_LIMIT_RETRY_SECS)
         end
       elseif status == 401 or status == 403 then
         local auth_err = "auth failed — waiting for Claude Code"
@@ -979,6 +988,8 @@ local function build_status_string(data, window, pane)
   if data.not_running then
     claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "not running"
   elseif data.syncing then
+    claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "syncing..."
+  elseif is_rate_limited_error(data.error) then
     claude_str = DIM .. " ⚡ " .. BRIGHT .. "Claude: " .. DIM .. "syncing..."
   elseif data.error then
     claude_str = DIM .. " ⚡ Claude: "

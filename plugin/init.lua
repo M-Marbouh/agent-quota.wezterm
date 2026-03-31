@@ -27,6 +27,24 @@ local last_error = nil
 local handler_registered = false
 local cached_token = nil
 
+-- In-memory fast-path: avoid all I/O when data was checked very recently
+local FETCH_GATE_SECS = 1         -- min seconds between full fetch cycles
+local PROCESS_CHECK_TTL = 5       -- cache is_*_running() results for this long
+
+-- Claude process-state cache
+local claude_running_cached = nil
+local claude_running_checked_at = 0
+
+-- Codex process-state cache
+local codex_running_cached = nil
+local codex_running_checked_at = 0
+
+-- In-memory fast-path data (last returned result + timestamp)
+local claude_last_result = nil
+local claude_last_result_at = 0
+local codex_last_result = nil
+local codex_last_result_at = 0
+
 -- ANSI escape helpers (bypass wezterm.format to avoid nightly deserialization bugs)
 local ESC = "\x1b["
 local RESET = ESC .. "0m"
@@ -602,15 +620,34 @@ end
 -- Uses ps rather than /proc to work reliably in WezTerm's GUI subprocess environment.
 -- Used only as a display hint — never gates quota fetching.
 local function is_codex_running()
-  local ok, stdout = wezterm.run_child_process({
-    "sh", "-c",
-    "ps -eo comm=,tty= | grep '^codex ' | grep -qv ' ?$' && echo yes",
-  })
-  return ok and stdout ~= nil and stdout:find("yes", 1, true) ~= nil
+  local now = os.time()
+  if now - codex_running_checked_at < PROCESS_CHECK_TTL then
+    return codex_running_cached
+  end
+  -- Single ps call; parse in Lua instead of spawning sh + grep + grep
+  local ok, stdout = wezterm.run_child_process({ "ps", "-eo", "comm=,tty=" })
+  local found = false
+  if ok and stdout then
+    for line in stdout:gmatch("[^\n]+") do
+      if line:match("^codex ") and not line:match("%s%?$") then
+        found = true
+        break
+      end
+    end
+  end
+  codex_running_cached = found
+  codex_running_checked_at = now
+  return codex_running_cached
 end
 
 local function fetch_codex_limits()
   local now = os.time()
+
+  -- In-memory fast path: skip all I/O if checked very recently
+  if codex_last_result and (now - codex_last_result_at) < FETCH_GATE_SECS then
+    return codex_last_result, codex_running_cached
+  end
+
   local codex_active = is_codex_running()
 
   -- No running gate: quota is account-level and always fetchable.
@@ -620,7 +657,9 @@ local function fetch_codex_limits()
     codex_cached = { error = "missing bundled codex helper" }
     codex_errors = codex_errors + 1
     codex_last_error = "missing bundled codex helper"
-    return codex_cached
+    codex_last_result = codex_cached
+    codex_last_result_at = now
+    return codex_cached, codex_active
   end
 
   -- Read shared cache, but discard it if it contains stale not-running data
@@ -644,7 +683,9 @@ local function fetch_codex_limits()
 
   if shared_cache_is_fresh(shared, now) then
     if not (codex_active and type(shared.data) == "table" and shared.data.error == "not running") then
-      return shared.data
+      codex_last_result = shared.data
+      codex_last_result_at = now
+      return shared.data, codex_active
     end
   end
 
@@ -652,9 +693,14 @@ local function fetch_codex_limits()
     shared = read_shared_cache(CODEX_CACHE_PATH)
     sync_codex_shared_state(shared)
     if shared and shared.data then
-      return shared.data
+      codex_last_result = shared.data
+      codex_last_result_at = now
+      return shared.data, codex_active
     end
-    return codex_cached or { error = codex_last_error or "waiting for shared refresh" }
+    local fallback = codex_cached or { error = codex_last_error or "waiting for shared refresh" }
+    codex_last_result = fallback
+    codex_last_result_at = now
+    return fallback, codex_active
   end
 
   local entry
@@ -664,7 +710,9 @@ local function fetch_codex_limits()
   if shared_cache_is_fresh(locked_cache, now) then
     if not (codex_active and type(locked_cache.data) == "table" and locked_cache.data.error == "not running") then
       release_lock(CODEX_LOCK_DIR)
-      return locked_cache.data
+      codex_last_result = locked_cache.data
+      codex_last_result_at = now
+      return locked_cache.data, codex_active
     end
   end
 
@@ -725,7 +773,9 @@ local function fetch_codex_limits()
 
   release_lock(CODEX_LOCK_DIR)
   sync_codex_shared_state(entry)
-  return entry.data
+  codex_last_result = entry.data
+  codex_last_result_at = now
+  return entry.data, codex_active
 end
 
 -- ============================================================
@@ -877,23 +927,38 @@ local function call_usage_api(token)
 end
 
 local function is_claude_running()
+  local now = os.time()
+  if now - claude_running_checked_at < PROCESS_CHECK_TTL then
+    return claude_running_cached
+  end
   local ok, stdout = wezterm.run_child_process({ "pgrep", "-x", "claude" })
-  return ok and stdout and stdout:match("%d") ~= nil
+  claude_running_cached = ok and stdout and stdout:match("%d") ~= nil
+  claude_running_checked_at = now
+  return claude_running_cached
 end
 
 -- Fetch usage data (synchronous curl call cached at the polling interval)
 local function fetch_usage()
   local now = os.time()
 
+  -- In-memory fast path: skip all I/O if checked very recently
+  if claude_last_result and (now - claude_last_result_at) < FETCH_GATE_SECS then
+    return claude_last_result
+  end
+
   -- Always check process state first — never show stale data when Claude is closed
   if not is_claude_running() then
-    return { not_running = true }
+    claude_last_result = { not_running = true }
+    claude_last_result_at = now
+    return claude_last_result
   end
 
   local shared = read_shared_cache(CLAUDE_CACHE_PATH)
   sync_claude_shared_state(shared)
 
   if shared_cache_is_fresh(shared, now) then
+    claude_last_result = shared.data
+    claude_last_result_at = now
     return shared.data
   end
 
@@ -901,9 +966,14 @@ local function fetch_usage()
     shared = read_shared_cache(CLAUDE_CACHE_PATH)
     sync_claude_shared_state(shared)
     if shared and shared.data then
+      claude_last_result = shared.data
+      claude_last_result_at = now
       return shared.data
     end
-    return cached_data or { error = last_error or "waiting for shared refresh" }
+    local fallback = cached_data or { error = last_error or "waiting for shared refresh" }
+    claude_last_result = fallback
+    claude_last_result_at = now
+    return fallback
   end
 
   local entry
@@ -912,6 +982,8 @@ local function fetch_usage()
 
   if shared_cache_is_fresh(locked_cache, now) then
     release_lock(CLAUDE_LOCK_DIR)
+    claude_last_result = locked_cache.data
+    claude_last_result_at = now
     return locked_cache.data
   end
 
@@ -975,6 +1047,8 @@ local function fetch_usage()
 
   release_lock(CLAUDE_LOCK_DIR)
   sync_claude_shared_state(entry)
+  claude_last_result = entry.data
+  claude_last_result_at = now
   return entry.data
 end
 
@@ -1023,8 +1097,7 @@ local function build_status_string(data, window, pane)
 
   -- ── Codex ───────────────────────────────────────────────
   local codex_str
-  local cd = fetch_codex_limits()
-  local codex_active = is_codex_running()
+  local cd, codex_active = fetch_codex_limits()
 
   if not codex_active then
     codex_str = DIM .. " ✦ " .. BRIGHT .. "Codex: " .. DIM .. "not running"

@@ -244,7 +244,12 @@ local CODEX_CACHE_PATH = SHARED_CACHE_PREFIX .. "-codex.json"
 local CODEX_LOCK_DIR = SHARED_CACHE_PREFIX .. "-codex.lock"
 local LOCK_TIMEOUT_SECS = 30
 local INVALID_STALE_RETRY_SECS = 15
+local CLAUDE_TRANSIENT_RETRY_SECS = 30
 local CLAUDE_RATE_LIMIT_RETRY_SECS = 60
+local CLAUDE_FAST_POLL_SECS = 15
+local CLAUDE_HIGH_USAGE_POLL_SECS = 30
+local CLAUDE_FAST_POLL_WINDOW_SECS = 10 * 60
+local CLAUDE_HIGH_UTILIZATION_PCT = 90
 
 local function json_escape(str)
   local replacements = {
@@ -382,6 +387,19 @@ local function read_shared_cache(path)
   return entry
 end
 
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+
+  local era = math.floor(year / 400)
+  local yoe = year - (era * 400)
+  local mp = month + (month > 2 and -3 or 9)
+  local doy = math.floor((153 * mp + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
 local function unix_from_iso_utc(reset_str)
   if type(reset_str) ~= "string" or reset_str == "" then
     return nil
@@ -393,18 +411,24 @@ local function unix_from_iso_utc(reset_str)
     return nil
   end
 
-  local local_ts = os.time({
-    year = tonumber(year),
-    month = tonumber(month),
-    day = tonumber(day),
-    hour = tonumber(hour),
-    min = tonumber(min),
-    sec = tonumber(sec),
-  })
+  local sign, offset_hour, offset_min = reset_str:match("([+-])(%d%d):?(%d%d)$")
+  local offset_secs = 0
+  if sign and offset_hour and offset_min then
+    offset_secs = tonumber(offset_hour) * 3600 + tonumber(offset_min) * 60
+    if sign == "-" then
+      offset_secs = -offset_secs
+    end
+  elseif not reset_str:match("[Zz]$") then
+    return nil
+  end
 
-  local now_local = os.time()
-  local now_utc = os.time(os.date("!*t", now_local))
-  return local_ts - (now_utc - now_local)
+  local epoch =
+    days_from_civil(tonumber(year), tonumber(month), tonumber(day)) * 86400
+    + tonumber(hour) * 3600
+    + tonumber(min) * 60
+    + tonumber(sec)
+
+  return epoch - offset_secs
 end
 
 local function earliest_reset_boundary_ts(data)
@@ -443,6 +467,33 @@ end
 local function data_crossed_reset_boundary(data, now)
   local reset_at = earliest_reset_boundary_ts(data)
   return reset_at ~= nil and now >= reset_at
+end
+
+local function seconds_until_reset_boundary(data, now)
+  local reset_at = earliest_reset_boundary_ts(data)
+  if not reset_at then
+    return nil
+  end
+  return reset_at - (now or os.time())
+end
+
+local function claude_fast_poll_secs(data, now)
+  if type(data) ~= "table" or data.not_running or data.syncing or data.error then
+    return nil
+  end
+
+  local remaining = seconds_until_reset_boundary(data, now)
+  if remaining ~= nil and remaining > 0 and remaining <= CLAUDE_FAST_POLL_WINDOW_SECS then
+    return CLAUDE_FAST_POLL_SECS
+  end
+
+  local five_pct = data.five_hour and tonumber(data.five_hour.utilization) or 0
+  local seven_pct = data.seven_day and tonumber(data.seven_day.utilization) or 0
+  if math.max(five_pct, seven_pct) >= CLAUDE_HIGH_UTILIZATION_PCT then
+    return CLAUDE_HIGH_USAGE_POLL_SECS
+  end
+
+  return nil
 end
 
 local function is_rate_limited_error(err)
@@ -537,6 +588,35 @@ local function transient_refresh_entry(previous_data, previous_errors, last_err,
   end
 
   return build_cache_entry(previous_data or { error = last_err }, previous_errors + 1, last_err, now)
+end
+
+local function claude_success_retry_secs(data, now)
+  local normal_retry = tonumber(config.poll_interval_secs) or 60
+  local fast_retry = claude_fast_poll_secs(data, now)
+  if fast_retry then
+    return math.min(normal_retry, fast_retry)
+  end
+  return normal_retry
+end
+
+local function claude_transient_refresh_entry(previous_data, previous_errors, last_err, now, raw_previous)
+  if type(raw_previous) == "table" and (raw_previous.syncing or data_crossed_reset_boundary(raw_previous, now)) then
+    return build_cache_entry(
+      { syncing = true },
+      previous_errors + 1,
+      last_err,
+      now,
+      INVALID_STALE_RETRY_SECS
+    )
+  end
+
+  local retry_secs = CLAUDE_TRANSIENT_RETRY_SECS
+  local fast_retry = claude_fast_poll_secs(previous_data, now)
+  if fast_retry then
+    retry_secs = math.min(retry_secs, fast_retry)
+  end
+
+  return build_cache_entry(previous_data or { error = last_err }, previous_errors + 1, last_err, now, retry_secs)
 end
 
 -- ============================================================
@@ -825,26 +905,12 @@ local function time_until(reset_str)
     return "?"
   end
 
-  -- Parse ISO 8601: 2026-03-08T04:59:59.000000+00:00
-  local year, month, day, hour, min, sec =
-    reset_str:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
-  if not year then
+  local reset_time = unix_from_iso_utc(reset_str)
+  if not reset_time then
     return "?"
   end
 
-  local reset_time = os.time({
-    year = tonumber(year),
-    month = tonumber(month),
-    day = tonumber(day),
-    hour = tonumber(hour),
-    min = tonumber(min),
-    sec = tonumber(sec),
-  })
-
-  -- reset_str is UTC, os.time gives local — adjust
-  local now_local = os.time()
-  local now_utc = os.time(os.date("!*t", now_local))
-  local diff = reset_time - now_utc
+  local diff = reset_time - os.time()
 
   if diff <= 0 then
     return "now"
@@ -994,7 +1060,7 @@ local function fetch_usage()
   -- Re-read token from disk each fetch — Claude Code may have refreshed it
   local token, expires_at, err = get_token()
   if not token then
-    entry = transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
+    entry = claude_transient_refresh_entry(previous_data, previous_errors, err, now, raw_previous)
   else
     -- If the token changed on disk (Claude Code refreshed it), reset error state
     if cached_token and token ~= cached_token then
@@ -1007,12 +1073,12 @@ local function fetch_usage()
     local now_ms = math.floor(now * 1000)
     if expires_at and now_ms >= expires_at then
       local token_err = "token expired — waiting for Claude Code"
-      entry = transient_refresh_entry(previous_data, previous_errors, token_err, now, raw_previous)
+      entry = claude_transient_refresh_entry(previous_data, previous_errors, token_err, now, raw_previous)
     else
       local body, status, curl_err = call_usage_api(token)
 
       if curl_err then
-        entry = transient_refresh_entry(previous_data, previous_errors, curl_err, now, raw_previous)
+        entry = claude_transient_refresh_entry(previous_data, previous_errors, curl_err, now, raw_previous)
       elseif status == 429 then
         local next_errors = previous_errors + 1
         local wait = interval_for_errors(next_errors)
@@ -1024,17 +1090,17 @@ local function fetch_usage()
         end
       elseif status == 401 or status == 403 then
         local auth_err = "auth failed — waiting for Claude Code"
-        entry = transient_refresh_entry(previous_data, previous_errors, auth_err, now, raw_previous)
+        entry = claude_transient_refresh_entry(previous_data, previous_errors, auth_err, now, raw_previous)
       else
         local ok, data = pcall(wezterm.json_parse, body)
         if not ok or not data then
           local parse_err = "parse failed"
-          entry = transient_refresh_entry(previous_data, previous_errors, parse_err, now, raw_previous)
+          entry = claude_transient_refresh_entry(previous_data, previous_errors, parse_err, now, raw_previous)
         elseif data.error then
           local api_err = data.error.message or "api error"
-          entry = transient_refresh_entry(previous_data, previous_errors, api_err, now, raw_previous)
+          entry = claude_transient_refresh_entry(previous_data, previous_errors, api_err, now, raw_previous)
         else
-          entry = build_cache_entry(data, 0, nil, now)
+          entry = build_cache_entry(data, 0, nil, now, claude_success_retry_secs(data, now))
         end
       end
     end

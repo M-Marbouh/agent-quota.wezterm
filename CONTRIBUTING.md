@@ -17,6 +17,7 @@ For normal usage, prefer the published plugin install in the README.
 
 - `plugin/init.lua`: main WezTerm plugin logic
 - `codex-limits.py`: bundled Codex helper
+- `tmux-quota.py`: optional standalone tmux status command
 - `README.md`: user-facing documentation
 
 ## Checks
@@ -25,6 +26,8 @@ Run these before opening a pull request:
 
 ```bash
 python3 -m py_compile codex-limits.py
+python3 -m py_compile tmux-quota.py
+python3 -m unittest discover -s tests -v
 python3 codex-limits.py
 ls -l /tmp/wezterm-quota-limit-"$USER"-*.json
 ```
@@ -36,6 +39,8 @@ Also reload WezTerm and manually test:
 - Codex only
 - both running
 - multiple WezTerm windows sharing the cache
+
+The tmux command can be used on its own from any terminal, including a remote SSH session attached to a tmux server. Add it with `set-option -ag status-right ...` to append to the current right-side status. Tmux itself must run on the machine with Python 3 and the provider CLI installations. Tmux tests use an isolated server and clean it up when complete.
 
 ## Style
 

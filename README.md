@@ -5,6 +5,7 @@
 [Listed on Awesome WezTerm](https://github.com/michaelbrusegard/awesome-wezterm#ai)
 
 A WezTerm plugin that shows Claude and Codex quota usage directly in the status bar.
+An optional standalone tmux status command provides the same account view on the machine running tmux, including remote and headless tmux servers.
 
 It displays live usage windows returned by each provider, reset countdowns, process-aware `not running` states, compact percentage bars, and a shared cache so multiple WezTerm windows do not all refresh the same data independently.
 
@@ -21,6 +22,7 @@ It displays live usage windows returned by each provider, reset countdowns, proc
 - Bundled Codex helper auto-discovery with no manual script-path setup
 - Optional Claude usage dashboard shortcut
 - Configurable status-bar side, icons, polling interval, and bar glyphs
+- Optional tmux integration with an independent cache and no WezTerm dependency
 
 Example output:
 
@@ -71,6 +73,41 @@ return config
 Reload WezTerm with `CTRL+SHIFT+R`, or restart WezTerm fully.
 
 No extra Python path configuration is required. The plugin resolves its bundled `codex-limits.py` helper automatically.
+
+### tmux
+
+The tmux integration is optional and works independently of WezTerm. Clone the repository on the host that runs tmux. It needs Python 3, tmux, Claude Code and/or Codex CLI, and a network connection for account usage reads. SSH clients only need to connect to the tmux server; quota fetching happens on the tmux host. The helper discovers `codex` in common install locations, including `~/.local/bin`, even when tmux has a small `PATH`.
+
+Append the helper to the right side of the existing tmux status line:
+
+```tmux
+set-option -g status-right-length 180
+set-option -ag status-right '  #(python3 "/absolute/path/to/wezterm-quota-limit/tmux-quota.py")'
+```
+
+For an installation path containing spaces, print a shell-quoted command fragment with:
+
+```sh
+python3 /absolute/path/to/wezterm-quota-limit/tmux-quota.py --tmux-command
+```
+
+The command prints a shell fragment; it does not escape the surrounding `tmux.conf` string. Place it inside a double-quoted `status-right` argument, for example:
+
+```tmux
+set-option -ag status-right "  #(python3 '/absolute/path with spaces/wezterm-quota-limit/tmux-quota.py')"
+```
+
+This form supports spaces in the installation path. Keep quote characters out of the path because they need additional escaping for `tmux.conf`.
+
+`set-option -ag` preserves the current status content. The default `status-right-length` of 40 is too short for both providers, so the example raises it to 180 characters; increase it further if your existing status content is long. Tmux clips status content on narrow terminals, so both providers may not fit when the attached terminal is narrow. Tmux refreshes the command on its normal `status-interval` (15 seconds by default); account requests use a separate per-user cache and are limited to once per minute on success, with persisted retry delays after failures. The cache lives in `~/.cache/wezterm-quota-limit-tmux` with private directory and file permissions. It does not read or overwrite the WezTerm cache in `/tmp`.
+
+Example tmux output:
+
+```text
+C Claude: 5h [###-----] 42% (2h31m)  |  X Codex: 5h [#######-] 88% (2h10m)  7d [###-----] 32% (1d4h)
+```
+
+Tmux uses its native `#[...]` styles. Bars use ASCII characters to work in minimal terminal fonts. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
 
 ## Configuration
 
@@ -186,9 +223,17 @@ Status display:
 - colors usage as green under `50%`, yellow from `50%` to `79%`, and red at `80%` and above
 - renders compact 8-cell bars by default
 
+tmux:
+
+- runs `tmux-quota.py` from `status-right`, so it does not depend on WezTerm or an active pane being a Claude pane
+- detects Claude and Codex processes across the tmux host, including detached sessions
+- invokes the existing `codex-limits.py` helper and reads Claude's OAuth token only while Claude is running
+- stores independent per-provider cache files under `~/.cache/wezterm-quota-limit-tmux`
+- renders provider window durations and reset times using tmux styles and plain ASCII bars
+
 ## Compatibility
 
-- Targets: Linux and Windows desktop sessions running WezTerm.
+- Targets: Linux and Windows desktop sessions running WezTerm; tmux integration targets Unix-like tmux hosts.
 - Claude credentials are read from `~/.claude/.credentials.json`.
 - Codex usage is read through `codex app-server --listen stdio://`, so the installed Codex CLI must support app-server rate-limit reads.
 - Required command-line tools on Linux are `python3`, `curl`, `pgrep`, `ps`, `mkdir`, `rmdir`, and GNU `stat`; on Windows they are `python`/`python3`, `curl`, and `tasklist`.
@@ -198,6 +243,7 @@ Status display:
 - The plugin does not refresh Claude or Codex authentication itself; it waits for the corresponding CLI to keep credentials valid.
 - Codex displays `not running` unless an interactive Codex process is attached to a terminal. Quota data may still be fetchable in the background, but the visible status remains process-aware.
 - Claude usage calls are intentionally cached and retried with backoff to avoid unnecessary API pressure.
+- Tmux reads the installed Claude OAuth access token without refreshing it; after expiry, Claude Code must refresh credentials before usage returns.
 - macOS is not currently a tested release target.
 
 ## Troubleshooting

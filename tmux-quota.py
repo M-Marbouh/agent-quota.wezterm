@@ -406,64 +406,102 @@ def tmux_text(value: Any) -> str:
     return text[:48]
 
 
-def quota_bar(percent: float) -> str:
+def quota_bar(percent: float, use_unicode: bool = False) -> str:
     filled = min(BAR_WIDTH, max(0, round(percent * BAR_WIDTH / 100)))
+    if use_unicode:
+        return "█" * filled + "░" * (BAR_WIDTH - filled)
     return "[" + ("#" * filled) + ("-" * (BAR_WIDTH - filled)) + "]"
 
 
-def styled_provider(name: str, data: dict[str, Any], now: float) -> str:
-    icon = "C" if name == "Claude" else "X"
-    prefix = f"#[fg=colour245]{icon} {name}:#[default]"
+def styled_provider(
+    name: str, data: dict[str, Any], now: float, use_unicode: bool = False
+) -> str:
+    if use_unicode:
+        icon = "⚡" if name == "Claude" else "✦"
+        prefix = f"#[fg=#c0caf5]{icon} {name}:#[default]"
+        state_color = "#c0caf5"
+    else:
+        icon = "C" if name == "Claude" else "X"
+        prefix = f"#[fg=colour245]{icon} {name}:#[default]"
+        state_color = "colour245"
     status = data.get("status")
     if status == "not_running":
-        return prefix + " #[fg=colour245]not running#[default]"
+        return prefix + f" #[fg={state_color}]not running#[default]"
     if status == "syncing":
-        return prefix + " #[fg=colour245]syncing#[default]"
+        return prefix + f" #[fg={state_color}]syncing#[default]"
     windows = data.get("windows") if isinstance(data.get("windows"), list) else []
     if not windows:
         state = "syncing" if status == "rate_limited" else "unavailable"
-        return prefix + f" #[fg=colour245]{state}#[default]"
+        return prefix + f" #[fg={state_color}]{state}#[default]"
     rendered = []
     if data.get("stale") or data.get("display_state") == "stale":
-        rendered.append("#[fg=colour214]stale#[default]")
+        stale_color = "#e0af68" if use_unicode else "colour214"
+        rendered.append(f"#[fg={stale_color}]stale#[default]")
     for window in windows:
         label = tmux_text(window.get("label", "usage")) or "usage"
         percent = window.get("percent")
         if not isinstance(percent, (int, float)):
             continue
-        color = "colour40" if percent < 50 else "colour220" if percent < 80 else "colour196"
-        bar = quota_bar(float(percent))
+        if use_unicode:
+            color = "#9ece6a" if percent < 50 else "#e0af68" if percent < 80 else "#f7768e"
+        else:
+            color = "colour40" if percent < 50 else "colour220" if percent < 80 else "colour196"
+        bar = quota_bar(float(percent), use_unicode)
         remaining = countdown(window.get("reset_at"), now)
-        suffix = f" ({remaining})" if remaining else ""
-        rendered.append(f"#[fg=colour252]{label} {bar} #[fg={color}]{percent:.0f}%{suffix}#[default]")
-    return prefix + (" " + "  ".join(rendered) if rendered else " #[fg=colour245]unavailable#[default]")
+        if use_unicode:
+            filled = bar.count("█")
+            bar = f"#[fg={color}]{bar[:filled]}#[fg=#565f89]{bar[filled:]}#[default]"
+            timer = f" #[fg=#a9b1d6]({remaining})#[default]" if remaining else ""
+            rendered.append(
+                f"#[fg=#c0caf5]{label}#[default] {bar} "
+                f"#[fg={color}]{percent:.0f}%#[default]{timer}"
+            )
+        else:
+            suffix = f" ({remaining})" if remaining else ""
+            rendered.append(f"#[fg=colour252]{label} {bar} #[fg={color}]{percent:.0f}%{suffix}#[default]")
+    separator = "  #[fg=#7a83a5]·#[default]  " if use_unicode else "  "
+    unavailable_color = "#c0caf5" if use_unicode else "colour245"
+    return prefix + (" " + separator.join(rendered) if rendered else f" #[fg={unavailable_color}]unavailable#[default]")
 
 
-def render_status(states: dict[str, bool], claude: dict[str, Any], codex: dict[str, Any], now: float | None = None) -> str:
+def render_status(
+    states: dict[str, bool],
+    claude: dict[str, Any],
+    codex: dict[str, Any],
+    now: float | None = None,
+    use_unicode: bool = False,
+) -> str:
     current = time.time() if now is None else now
-    return styled_provider("Claude", claude if states.get("claude") else {"status": "not_running"}, current) + "  #[fg=colour238]|#[default]  " + styled_provider("Codex", codex if states.get("codex") else {"status": "not_running"}, current)
+    separator = "  #[fg=#7a83a5]·#[default]  " if use_unicode else "  #[fg=colour238]|#[default]  "
+    claude_data = claude if states.get("claude") else {"status": "not_running"}
+    codex_data = codex if states.get("codex") else {"status": "not_running"}
+    claude_status = styled_provider("Claude", claude_data, current, use_unicode)
+    codex_status = styled_provider("Codex", codex_data, current, use_unicode)
+    return claude_status + separator + codex_status
 
 
-def run_status() -> str:
+def run_status(use_unicode: bool = False) -> str:
     now = time.time()
     states = process_states()
     root = cache_dir()
     helper = Path(__file__).with_name("codex-limits.py")
     claude = provider_data("claude", states["claude"], now, lambda: fetch_claude(Path.home() / ".claude/.credentials.json", now), root)
     codex = provider_data("codex", states["codex"], now, lambda: fetch_codex(helper), root)
-    return render_status(states, claude, codex, now)
+    return render_status(states, claude, codex, now, use_unicode)
 
 
-def tmux_command(path: Path) -> str:
-    return "#(python3 " + shlex.quote(str(path.resolve())) + ")"
+def tmux_command(path: Path, use_unicode: bool = False) -> str:
+    flag = " --unicode" if use_unicode else ""
+    return "#(python3 " + shlex.quote(str(path.resolve())) + flag + ")"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmux-command", action="store_true", help="print a status-right command for this file")
+    parser.add_argument("--unicode", action="store_true", help="render tmux-native Unicode icons and usage bars")
     args = parser.parse_args()
     try:
-        print(tmux_command(Path(__file__)) if args.tmux_command else run_status())
+        print(tmux_command(Path(__file__), args.unicode) if args.tmux_command else run_status(args.unicode))
     except Exception:
         print("#[fg=colour245]Quota unavailable#[default]")
     return 0

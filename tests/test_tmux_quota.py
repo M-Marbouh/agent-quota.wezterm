@@ -1,10 +1,14 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -399,12 +403,129 @@ class RenderingTests(unittest.TestCase):
     def test_all_process_combinations(self):
         claude = {"status": "ok", "windows": [{"label": "5h", "percent": 20}]}
         codex = {"status": "ok", "windows": [{"label": "1d", "percent": 30}]}
-        for states in ({"claude": False, "codex": False}, {"claude": True, "codex": False},
-                       {"claude": False, "codex": True}, {"claude": True, "codex": True}):
-            text = quota.render_status(states, claude, codex, now=1)
-            self.assertEqual(text.count("not running"), sum(not active for active in states.values()))
-            self.assertEqual("5h" in text, states["claude"])
-            self.assertEqual("1d" in text, states["codex"])
+        for use_unicode in (False, True):
+            for states in ({"claude": False, "codex": False}, {"claude": True, "codex": False},
+                           {"claude": False, "codex": True}, {"claude": True, "codex": True}):
+                text = quota.render_status(states, claude, codex, now=1, use_unicode=use_unicode)
+                self.assertEqual(text.count("not running"), sum(not active for active in states.values()))
+                self.assertEqual("5h" in text, states["claude"])
+                self.assertEqual("1d" in text, states["codex"])
+
+    def test_default_ascii_rendering_remains_unchanged(self):
+        claude = {"status": "ok", "windows": [{"label": "5h", "percent": 42, "reset_at": 1000}]}
+        actual = quota.render_status({"claude": True, "codex": False}, claude, {}, now=100)
+        self.assertEqual(
+            actual,
+            "#[fg=colour245]C Claude:#[default] #[fg=colour252]5h [###-----] #[fg=colour40]42% (15m)#[default]"
+            "  #[fg=colour238]|#[default]  #[fg=colour245]X Codex:#[default] #[fg=colour245]not running#[default]",
+        )
+        self.assertEqual(quota.quota_bar(42), "[###-----]")
+
+    def test_unicode_bar_has_eight_cells_and_clamps(self):
+        self.assertEqual(quota.quota_bar(0, use_unicode=True), "░" * 8)
+        self.assertEqual(quota.quota_bar(100, use_unicode=True), "█" * 8)
+        self.assertEqual(quota.quota_bar(-25, use_unicode=True), "░" * 8)
+        self.assertEqual(quota.quota_bar(125, use_unicode=True), "█" * 8)
+        self.assertEqual(len(quota.quota_bar(42, use_unicode=True)), 8)
+
+    def test_unicode_thresholds_timer_separation_and_style_reset(self):
+        windows = [
+            {"label": "under50", "percent": 49.9, "reset_at": 7200},
+            {"label": "at50", "percent": 50},
+            {"label": "under80", "percent": 79.9},
+            {"label": "at80", "percent": 80},
+        ]
+        text = quota.render_status(
+            {"claude": True, "codex": False},
+            {"status": "ok", "windows": windows, "stale": True},
+            {},
+            now=0,
+            use_unicode=True,
+        )
+        self.assertIn("⚡ Claude:", text)
+        self.assertIn("#[fg=#e0af68]stale#[default]", text)
+        for label, color in (("under50", "#9ece6a"), ("at50", "#e0af68"),
+                             ("under80", "#e0af68"), ("at80", "#f7768e")):
+            start = text.index(label)
+            end = text.find("  #[fg=#7a83a5]·#[default]  ", start)
+            segment = text[start:] if end < 0 else text[start:end]
+            self.assertIn(f"#[fg={color}]", segment)
+        self.assertIn("#[fg=#a9b1d6](2h00m)#[default]", text)
+        self.assertIn("#[fg=#565f89]", text)
+        self.assertTrue(text.endswith("#[default]"))
+        self.assertNotIn("#[fg=colour", text)
+
+    def test_unicode_states_multiple_windows_and_sanitization(self):
+        text = quota.render_status(
+            {"claude": True, "codex": True},
+            {"status": "ok", "windows": [
+                {"label": "5h#{bad}", "percent": 0},
+                {"label": "7d", "percent": 100},
+            ]},
+            {"status": "syncing", "windows": []},
+            now=1,
+            use_unicode=True,
+        )
+        self.assertIn("⚡ Claude:", text)
+        self.assertIn("✦ Codex:", text)
+        self.assertIn("5hbad", text)
+        self.assertIn("░" * 8, text)
+        self.assertIn("█" * 8, text)
+        self.assertIn("#[fg=#c0caf5]syncing#[default]", text)
+        self.assertNotIn("#{bad}", text)
+        self.assertTrue(text.endswith("#[default]"))
+
+    def test_unicode_unavailable_and_rate_limited_states_are_readable(self):
+        text = quota.render_status(
+            {"claude": True, "codex": True},
+            {"status": "error", "windows": []},
+            {"status": "rate_limited", "windows": []},
+            use_unicode=True,
+        )
+        self.assertIn("#[fg=#c0caf5]unavailable#[default]", text)
+        self.assertIn("#[fg=#c0caf5]syncing#[default]", text)
+        self.assertTrue(text.endswith("#[default]"))
+
+    def test_run_status_passes_unicode_style_without_fetching(self):
+        states = {"claude": True, "codex": False}
+        claude = {"status": "ok", "windows": [{"label": "5h", "percent": 42}]}
+        with mock.patch.object(quota, "process_states", return_value=states), mock.patch.object(
+            quota, "cache_dir", return_value=Path("/unused")
+        ), mock.patch.object(quota, "provider_data", side_effect=[claude, {}]), mock.patch.object(
+            quota.time, "time", return_value=1
+        ):
+            text = quota.run_status(use_unicode=True)
+        self.assertIn("⚡ Claude:", text)
+        self.assertIn("█", text)
+
+    def test_unicode_cli_command_and_render_flag(self):
+        spaced = Path("/tmp/path with spaces/tmux-quota.py")
+        self.assertEqual(
+            quota.tmux_command(spaced, use_unicode=True),
+            f"#(python3 {shlex.quote(str(spaced.resolve()))} --unicode)",
+        )
+        result = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command", "--unicode"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(result.stdout.strip(), quota.tmux_command(SOURCE, use_unicode=True))
+        default_result = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(default_result.stdout.strip(), quota.tmux_command(SOURCE))
+        output = io.StringIO()
+        with mock.patch.object(quota, "run_status", return_value="UNICODE_STATUS") as run_status, \
+             mock.patch.object(sys, "argv", [str(SOURCE), "--unicode"]), contextlib.redirect_stdout(output):
+            self.assertEqual(quota.main(), 0)
+        run_status.assert_called_once_with(True)
+        self.assertEqual(output.getvalue(), "UNICODE_STATUS\n")
 
     def test_host_process_detection_includes_tmux_children(self):
         result = subprocess.CompletedProcess([], 0, "claude pts/4 claude --resume\ncodex pts/5 codex\nnode ? claude --chrome-native-host\ncodex ? codex app-server\n", "")

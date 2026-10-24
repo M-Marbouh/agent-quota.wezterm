@@ -32,30 +32,32 @@ Claude: 5h ███░░░░░ 42% (2h31m)  ▪ 7d █░░░░░░░
 
 ## Requirements
 
-Tested on Linux and Windows.
+Choose the requirements for the integration you use; the standalone tmux command does not require WezTerm.
+
+### WezTerm plugin
 
 - [WezTerm](https://wezterm.org/)
-- `python3` (or `python` on Windows)
-- `curl` (bundled with Windows 10/11)
-- Linux: `pgrep`, `ps`, `mkdir`, `rmdir`, and GNU `stat`
-- Windows: `tasklist` (bundled) for process detection
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated for Claude usage display
-- [OpenAI Codex CLI](https://github.com/openai/codex) installed and authenticated for Codex usage display
+- Python 3 (`python3` on Linux, or `python`/`python3` on Windows)
+- `curl`; Linux also needs `pgrep`, `ps`, `mkdir`, `rmdir`, and GNU `stat`; Windows uses bundled `tasklist` for process detection
+- [Claude Code](https://code.claude.com/docs/en/setup) and/or [Codex CLI](https://github.com/openai/codex) installed and authenticated for the provider(s) you want to display
 
-If you only use one tool, the other side simply shows `not running`.
+### Standalone tmux command
 
-On Debian/Ubuntu, missing system tools can usually be installed with:
+- A Unix-like host with tmux, Python 3, and `ps`
+- Git for the clone instructions below
+- [Claude Code](https://code.claude.com/docs/en/setup) and/or [Codex CLI](https://github.com/openai/codex) installed and authenticated on that same host for the provider(s) you want to display
+- Network access when usage data needs refreshing
+- For Unicode output, a UTF-8 terminal and fonts containing the displayed glyphs; ASCII output is available without those glyphs
 
-```bash
-sudo apt install python3 curl procps coreutils
-```
+Tmux checks for provider processes and reads credentials on the tmux host. Claude usage uses the existing `~/.claude/.credentials.json`; Codex usage uses the installed `codex` CLI and its existing authentication. The helper does not sign in or refresh credentials. If you use only one provider, the other shows `not running`.
 
-Expected credential files:
-
-- Claude: `~/.claude/.credentials.json`
-- Codex: `~/.codex/auth.json`
+On Debian/Ubuntu, missing WezTerm integration utilities can be installed with `sudo apt install python3 curl procps coreutils`. For the standalone tmux setup, use `sudo apt install git python3 tmux procps` if these tools are missing.
 
 ## Installation
+
+Choose the [WezTerm plugin](#wezterm-plugin-installation) or [standalone tmux](#standalone-tmux) instructions.
+
+### WezTerm plugin installation
 
 Install it with WezTerm's plugin loader:
 
@@ -74,44 +76,64 @@ Reload WezTerm with `CTRL+SHIFT+R`, or restart WezTerm fully.
 
 No extra Python path configuration is required. The plugin resolves its bundled `codex-limits.py` helper automatically.
 
-### tmux
+### Standalone tmux
 
-The tmux integration is optional and works independently of WezTerm. Clone the repository on the host that runs tmux. It needs Python 3, tmux, Claude Code and/or Codex CLI, and a network connection for account usage reads. SSH clients only need to connect to the tmux server; quota fetching happens on the tmux host. The helper discovers `codex` in common install locations, including `~/.local/bin`, even when tmux has a small `PATH`.
+This integration is optional and works without WezTerm or CCB. Install the helper on the machine where the tmux server runs. For a remote or headless server, the provider CLIs, their existing authentication, Python, and this repository all belong on that host; the SSH client only displays the host's tmux status line. The helper looks for `codex` in common locations, including `~/.local/bin`, if tmux has a small `PATH`.
 
-Append the helper to the right side of the existing tmux status line:
-
-```tmux
-set-option -g status-right-length 180
-set-option -ag status-right '  #(python3 "/absolute/path/to/wezterm-quota-limit/tmux-quota.py")'
-```
-
-For an installation path containing spaces, print a shell-quoted command fragment with:
+Clone the repository on the tmux host:
 
 ```sh
-python3 /absolute/path/to/wezterm-quota-limit/tmux-quota.py --tmux-command
+git clone https://github.com/M-Marbouh/agent-quota.wezterm.git
+cd agent-quota.wezterm
 ```
 
-The command prints a shell fragment; it does not escape the surrounding `tmux.conf` string. Place it inside a double-quoted `status-right` argument, for example:
+Keep `tmux-quota.py` and `codex-limits.py` together in the checkout. Add the following to `~/.tmux.conf`, replacing the path with your clone location. It preserves existing `status-right` content and avoids duplicate appends on reload. The example enables `--unicode` icons and block bars on a readable dark background; omit that flag for the default ASCII output:
 
 ```tmux
-set-option -ag status-right "  #(python3 '/absolute/path with spaces/wezterm-quota-limit/tmux-quota.py')"
+set-option -g status-style 'bg=#1e1e2e,fg=#cdd6f4'
+set-option -g status-right-length 180
+if-shell -F '#{m:*tmux-quota.py*,#{status-right}}' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode)"'
 ```
 
-This form supports spaces in the installation path. Keep quote characters out of the path because they need additional escaping for `tmux.conf`.
+Replace `/absolute/path/to` with the actual clone location. Start `tmux` to load the configuration. If the tmux server is already running, apply the changes with `tmux source-file ~/.tmux.conf`.
+
+When upgrading an existing setup, update the checkout first, then edit the existing helper command to add `--unicode`; the duplicate check intentionally keeps an existing command. Keep one helper invocation in `status-right`.
+
+For an installation path containing spaces, run this from the cloned repository to print a shell-quoted command fragment:
+
+```sh
+python3 tmux-quota.py --tmux-command --unicode
+```
+
+The command prints a shell fragment; it does not escape the surrounding `tmux.conf` string. Use the fragment in the reload-safe configuration above. A single append with a spaced path has this form:
+
+```tmux
+set-option -ag status-right "  #(python3 '/absolute/path with spaces/agent-quota.wezterm/tmux-quota.py' --unicode)"
+```
+
+This form supports spaces in the installation path. Keep quote characters out of the path because they need additional escaping for `tmux.conf`. The `--tmux-command` option prints only the shell command fragment; it does not contact either provider.
 
 `set-option -ag` preserves the current status content. The default `status-right-length` of 40 is too short for both providers, so the example raises it to 180 characters; increase it further if your existing status content is long. Tmux clips status content on narrow terminals, so both providers may not fit when the attached terminal is narrow. Tmux refreshes the command on its normal `status-interval` (15 seconds by default); account requests use a separate per-user cache and are limited to once per minute on success, with persisted retry delays after failures. The cache lives in `~/.cache/wezterm-quota-limit-tmux` with private directory and file permissions. It does not read or overwrite the WezTerm cache in `/tmp`.
 
-Example tmux output:
+Default ASCII/minimal-font output (omit `--unicode`):
 
 ```text
 C Claude: 5h [###-----] 42% (2h31m)  |  X Codex: 5h [#######-] 88% (2h10m)  7d [###-----] 32% (1d4h)
 ```
 
-Tmux uses its native `#[...]` styles. Bars use ASCII characters to work in minimal terminal fonts. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
+Unicode status-bar sample (filled bars use green below 50%, gold from 50% to 79%, and red from 80%; empty cells and reset countdowns use subdued, readable colors):
+
+```text
+⚡ Claude: 5h ███░░░░░ 42% (2h31m) · 7d █░░░░░░░ 18% (4d12h) · ✦ Codex: 5h ███████░ 88% (2h10m) · 7d ███░░░░░ 32% (1d4h)
+```
+
+Tmux uses its native `#[...]` styles. The default ASCII bars remain available for minimal terminal fonts by omitting `--unicode`; the Unicode mode uses standard glyphs and does not require a Nerd Font. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
+
+Other tmux themes or CCB status scripts may replace `status-right` after this command is added. In that case, put the helper fragment into the theme's own `status-right` definition, preserving its existing content and using the same duplicate check when the config can be reloaded. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
 
 ## Configuration
 
-Pass options to `apply_to_config(config, opts)`:
+For the WezTerm plugin, pass options to `apply_to_config(config, opts)`:
 
 ```lua
 quota.apply_to_config(config, {
@@ -229,14 +251,14 @@ tmux:
 - detects Claude and Codex processes across the tmux host, including detached sessions
 - invokes the existing `codex-limits.py` helper and reads Claude's OAuth token only while Claude is running
 - stores independent per-provider cache files under `~/.cache/wezterm-quota-limit-tmux`
-- renders provider window durations and reset times using tmux styles and plain ASCII bars
+- renders provider window durations and reset times using tmux styles, with ASCII bars by default and Unicode icons/block bars with `--unicode`
 
 ## Compatibility
 
 - Targets: Linux and Windows desktop sessions running WezTerm; tmux integration targets Unix-like tmux hosts.
 - Claude credentials are read from `~/.claude/.credentials.json`.
 - Codex usage is read through `codex app-server --listen stdio://`, so the installed Codex CLI must support app-server rate-limit reads.
-- Required command-line tools on Linux are `python3`, `curl`, `pgrep`, `ps`, `mkdir`, `rmdir`, and GNU `stat`; on Windows they are `python`/`python3`, `curl`, and `tasklist`.
+- Platform-specific tools differ between the WezTerm and tmux integrations; see [Requirements](#requirements).
 
 ## Known Limitations
 
@@ -248,12 +270,22 @@ tmux:
 
 ## Troubleshooting
 
-- Claude shows `not running`: confirm a Claude Code process is running with `pgrep -a -x claude` (Linux) or Task Manager (Windows), excluding the `--chrome-native-host` process.
-- Codex shows `not running`: open Codex in a WezTerm pane and keep that pane alive; detection uses WezTerm pane process info.
-- Codex helper fails in a GUI PATH environment: run `python3 codex-limits.py` directly; the helper auto-discovers common `nvm` installs.
+### WezTerm
+
+- Claude shows `not running`: confirm Claude Code is running; on Linux, `pgrep -a -x claude` can help distinguish it from the `--chrome-native-host` process.
+- Codex shows `not running`: keep an interactive Codex process running in a WezTerm pane; the WezTerm integration uses pane process information.
+- Codex helper fails in a GUI `PATH` environment: run `python3 codex-limits.py` directly; the helper also checks common `nvm` locations.
 - Codex helper path resolution fails in a custom environment: set `WEZTERM_AGENT_QUOTA_CODEX_HELPER=/absolute/path/to/codex-limits.py` before launching WezTerm.
-- Cached data looks stale: inspect or remove `/tmp/wezterm-quota-limit-"$USER"-*.json` and reload WezTerm.
+- Cached WezTerm data looks stale: inspect `/tmp/wezterm-quota-limit-"$USER"-*.json` and reload WezTerm; this cache is separate from tmux's cache.
 - Codex helper is missing: ensure the full plugin repo was installed, not just `plugin/init.lua` by itself.
+
+### tmux
+
+- `not running`: run the relevant provider CLI on the tmux host, not only on the SSH client. Codex process detection requires an interactive terminal; Claude's Chrome native host does not count as Claude Code.
+- `unavailable` or `syncing`: confirm the CLI is installed and its existing authentication is usable on the tmux host. The helper does not sign in or refresh credentials. `--tmux-command` can verify the generated command without fetching account data.
+- The status turns green or disappears after a theme/CCB change: that theme may have replaced `status-style` or `status-right`. Reapply a readable dark style and integrate the helper into the theme's own right-side format.
+- The bar is clipped: increase `status-right-length` and/or shorten neighboring widgets; available width depends on the attached terminal.
+- A value looks stale or does not update immediately: tmux refreshes the status command on its configured interval. Successful usage reads are cached for a minute; failures use a retry delay, and expired windows are not kept past their reset.
 
 ## Credit
 

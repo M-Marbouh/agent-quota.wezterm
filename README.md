@@ -7,6 +7,8 @@
 A WezTerm plugin that shows Claude and Codex quota usage directly in the status bar.
 An optional standalone tmux status command provides the same account view on the machine running tmux, including remote and headless tmux servers.
 
+**Works with [CCB](https://github.com/M-Marbouh/claude_code_bridge).** See the [optional CCB setup](#ccb-integration) for the required status-bar configuration.
+
 It displays live usage windows returned by each provider, reset countdowns, process-aware `not running` states, compact percentage bars, and a shared cache so multiple WezTerm windows do not all refresh the same data independently.
 
 ![Agent Quota status bar sample](assets/status-sample.svg)
@@ -92,10 +94,12 @@ Keep `tmux-quota.py` and `codex-limits.py` together in the checkout. Add the fol
 ```tmux
 set-option -g status-style 'bg=#1e1e2e,fg=#cdd6f4'
 set-option -g status-right-length 180
-if-shell -F '#{m:*tmux-quota.py*,#{status-right}}' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode)"'
+if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *tmux-quota.py*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode)"'
 ```
 
 Replace `/absolute/path/to` with the actual clone location. Start `tmux` to load the configuration. If the tmux server is already running, apply the changes with `tmux source-file ~/.tmux.conf`.
+
+The duplicate check reads the global option from the same tmux server. Checking `#{status-right}` instead can read a theme's session override and append duplicate global widgets when reloading inside CCB.
 
 When upgrading an existing setup, update the checkout first, then edit the existing helper command to add `--unicode`; the duplicate check intentionally keeps an existing command. Keep one helper invocation in `status-right`.
 
@@ -129,7 +133,25 @@ Unicode status-bar sample (filled bars use green below 50%, gold from 50% to 79%
 
 Tmux uses its native `#[...]` styles. The default ASCII bars remain available for minimal terminal fonts by omitting `--unicode`; the Unicode mode uses standard glyphs and does not require a Nerd Font. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
 
-Other tmux themes or CCB status scripts may replace `status-right` after this command is added. In that case, put the helper fragment into the theme's own `status-right` definition, preserving its existing content and using the same duplicate check when the config can be reloaded. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
+Other tmux themes may replace `status-right` after this command is added. Use the theme's supported extension point, preserving its existing content. A reload guard must check the same option scope the theme changes: global or per-session. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
+
+### CCB integration
+
+[CCB](https://github.com/M-Marbouh/claude_code_bridge) is optional. Use a CCB build with the documented [`@ccb_status_right_extra` extension](https://github.com/M-Marbouh/claude_code_bridge#tmux-status-right-extension) and the tmux theme lifecycle fixes. Older installed builds can ignore this option; updating a source checkout alone does not update the installed theme scripts.
+
+When upgrading from an older CCB build, exit its launchers before installing the update so the old scripts can restore their saved theme state. Start a fresh launcher afterward; replacing script files does not migrate an already-active legacy theme to the new lifecycle.
+
+Keep the standalone tmux configuration above for ordinary sessions. Add this separately in your own `~/.tmux.conf`, outside CCB's installer-managed block, replacing the path with your clone location:
+
+```tmux
+set-option -g @ccb_status_right_extra "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode)"
+```
+
+Reload with `tmux source-file ~/.tmux.conf`. A compatible active CCB theme reads the value live and displays the quotas after its clock. A per-session value overrides the global value. Assigning the option again on reload keeps one widget; if you already use this extension for other widgets, add the quota command once to that existing value. CCB restores the ordinary status when its launcher exits. Narrow terminals can still clip the combined status line.
+
+For paths with spaces, use the fragment printed by `python3 tmux-quota.py --tmux-command --unicode` inside the double-quoted option value, following the quoting guidance above. Literal percent signs in this option, including any in the command path, must be doubled as `%%` because CCB applies tmux time formatting. Percentages printed by the quota helper need no changes. Native `#[...]` styles and `#(...)` commands are supported.
+
+Do not edit CCB's installed theme scripts: its installer replaces them. If an older personal integration appends the quota through a hook or directly inside the theme, remove that extra append when switching to this option so the quota appears once. Check ordinary tmux, CCB activation, config reloads, and CCB exit after upgrading. This plugin uses the public extension and does not modify CCB's private restore state.
 
 ## Configuration
 

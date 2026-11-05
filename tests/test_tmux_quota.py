@@ -542,6 +542,141 @@ class RenderingTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("tmux") and pty is not None, "Unix tmux is required for the integration check")
 class TmuxIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("CCB_SOURCE_DIR"), "set CCB_SOURCE_DIR to check the optional CCB integration")
+    def test_ccb_extension_with_real_theme_scripts(self):
+        ccb = Path(os.environ["CCB_SOURCE_DIR"]).resolve()
+        self.assertIn("#{T:@ccb_status_right_extra}", (ccb / "config/ccb-tmux-on.sh").read_text())
+        setup = (SOURCE.parent / "README.md").read_text().split("### CCB integration\n", 1)[1].split("```tmux\n", 1)[1].split("```", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            socket = str(root / "tmux.sock")
+            binary = shutil.which("tmux")
+            base = [binary, "-S", socket, "-f", "/dev/null"]
+
+            def tmux(*args):
+                return subprocess.check_output(base + list(args), text=True, timeout=5).rstrip("\n")
+
+            def option(key):
+                return tmux("show-options", "-Aqv", "-t", "fixture", key)
+
+            def capture(required, forbidden=()):
+                master, slave = pty.openpty()
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 240, 0, 0))
+                client = subprocess.Popen(base + ["attach-session", "-t", "fixture"], stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "TERM": "xterm-256color"})
+                os.close(slave)
+                os.set_blocking(master, False)
+                output = bytearray()
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not all(part in output for part in required):
+                        try:
+                            output.extend(os.read(master, 65536))
+                        except BlockingIOError:
+                            time.sleep(0.05)
+                    for part in required:
+                        self.assertIn(part, output)
+                    for part in forbidden:
+                        self.assertNotIn(part, output)
+                finally:
+                    client.terminate()
+                    client.wait(timeout=3)
+                    os.close(master)
+
+            scripts = root / "bin"
+            scripts.mkdir()
+            for name in ("ccb-tmux-on.sh", "ccb-tmux-off.sh"):
+                shutil.copy2(ccb / "config" / name, scripts / name)
+            for name, output in (("ccb", "vFIXTURE"), ("ccb-status.sh", "CCB_FIXTURE"), ("ccb-git.sh", "branch"), ("ccb-border.sh", "")):
+                path = scripts / name
+                path.write_text(f"#!/bin/sh\nprintf '%s' {shlex.quote(output)}\n")
+                path.chmod(0o700)
+            shim = scripts / "tmux"
+            shim.write_text(f"#!/bin/sh\nexec {shlex.quote(binary)} -S {shlex.quote(socket)} \"$@\"\n")
+            shim.chmod(0o700)
+            clone = root / "clone with spaces 100%"
+            clone.mkdir()
+            fixture = clone / "tmux-quota.py"
+            fixture.write_text(
+                "import importlib.util, time\n"
+                f"s = importlib.util.spec_from_file_location('quota_fixture', {str(SOURCE)!r})\n"
+                "q = importlib.util.module_from_spec(s); s.loader.exec_module(q)\n"
+                "now = time.time()\n"
+                "def data(a, b):\n"
+                "    return {'status': 'ok', 'windows': [{'label': '5h', 'percent': a, 'reset_at': now + 9000}, {'label': '7d', 'percent': b, 'reset_at': now + 345600}]}\n"
+                "print(q.render_status({'claude': True, 'codex': True}, data(42, 18), data(88, 32), now, use_unicode=True))\n"
+            )
+            command = quota.tmux_command(fixture, use_unicode=True)
+            config = root / "quota.conf"
+            config.write_text(setup.replace("#(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode)", command.replace("%", "%%")))
+            try:
+                tmux("new-session", "-d", "-s", "fixture", "-x", "240", "-y", "30", "sleep 60")
+                pane = tmux("display-message", "-p", "#{pane_id}")
+                session = tmux("display-message", "-p", "#{session_id}")
+                window = tmux("display-message", "-p", "#{window_id}")
+                env = {**os.environ, "PATH": str(scripts) + os.pathsep + os.environ["PATH"], "TMUX": socket + ",0,0", "TMUX_PANE": pane, "CCB_THEME": "dark", "CCB_RUNTIME_TMP": directory}
+                args = ["--session", session, "--window", window, "--owner", "quota-test"]
+                tmux("set-option", "-g", "status-right", "EXISTING " + command.replace("%", "%%"))
+                tmux("set-option", "-g", "status-right-length", "180")
+                tmux("source-file", str(config))
+                keys = ("status", "status-style", "status-right", "status-right-length", "status-format[0]", "status-format[1]")
+                before = {key: option(key) for key in keys}
+                for _ in range(2):
+                    subprocess.run([str(scripts / "ccb-tmux-on.sh"), *args], env=env, check=True, capture_output=True, timeout=15)
+                    self.assertEqual(option("status-right").count("#{T:@ccb_status_right_extra}"), 1)
+                    for _ in range(2):
+                        tmux("source-file", str(config))
+                        self.assertEqual(option("@ccb_status_right_extra").count("tmux-quota.py"), 1)
+                    capture((b"CCB_FIXTURE", b"Claude", b"Codex", b"42%", b"88%", "█".encode(), "░".encode()))
+                    tmux("set-option", "-t", session, "@ccb_status_right_extra", " SESSION_OVERRIDE 73%%")
+                    tmux("source-file", str(config))
+                    capture((b"CCB_FIXTURE", b"SESSION_OVERRIDE 73%"), (b"42%", b"88%"))
+                    tmux("set-option", "-u", "-t", session, "@ccb_status_right_extra")
+                    tmux("set-option", "-g", "@ccb_status_right_extra", " BROKEN_CONTROL #(quota-command-does-not-exist)")
+                    capture((b"CCB_FIXTURE", b"BROKEN_CONTROL"), (b"42%", b"88%"))
+                    tmux("source-file", str(config))
+                    subprocess.run([str(scripts / "ccb-tmux-off.sh"), *args], env=env, check=True, capture_output=True, timeout=15)
+                    self.assertEqual({key: option(key) for key in keys}, before)
+                    self.assertEqual(option("status-right").count("tmux-quota.py"), 1)
+                    self.assertFalse(tmux("show-options", "-q", "-t", session, "status-format"))
+            finally:
+                subprocess.run(base + ["kill-server"], capture_output=True, timeout=3)
+
+    def test_documented_reload_checks_global_status_despite_session_override(self):
+        readme = (SOURCE.parent / "README.md").read_text()
+        append = next(line for line in readme.splitlines() if line.startswith("if-shell 'case"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            socket = str(root / "tmux.sock")
+            base = ["tmux", "-S", socket, "-f", "/dev/null"]
+
+            def tmux(*args):
+                return subprocess.check_output(base + list(args), text=True, timeout=5).rstrip("\n")
+
+            config = root / "tmux.conf"
+            config.write_text(append + "\n")
+            try:
+                tmux("new-session", "-d", "-s", "fixture")
+                tmux("set-option", "-g", "status-right", "KEEP_GLOBAL")
+                tmux("set-option", "-t", "fixture", "status-right", "CCB_OVERRIDE")
+                tmux("source-file", str(config))
+                first = tmux("show-option", "-gqv", "status-right")
+                self.assertEqual(first.count("tmux-quota.py"), 1)
+                self.assertIn("KEEP_GLOBAL", first)
+                for _ in range(2):
+                    tmux("source-file", "-t", "fixture:", str(config))
+                    self.assertEqual(tmux("show-option", "-gqv", "status-right"), first)
+                self.assertEqual(tmux("show-option", "-t", "fixture", "-qv", "status-right"), "CCB_OVERRIDE")
+
+                # Negative control: the former session-scoped guard duplicates the widget.
+                config.write_text(
+                    "if-shell -F '#{m:*tmux-quota.py*,#{status-right}}' '' "
+                    "'set-option -ag status-right \" #(python3 /fixture/tmux-quota.py)\"'\n"
+                )
+                tmux("source-file", "-t", "fixture:", str(config))
+                self.assertEqual(tmux("show-option", "-gqv", "status-right").count("tmux-quota.py"), 2)
+            finally:
+                subprocess.run(base + ["kill-server"], capture_output=True, timeout=3)
+
     def test_documented_append_displays_full_dual_provider_status_and_refreshes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

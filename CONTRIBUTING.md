@@ -49,6 +49,14 @@ For changes to the WezTerm UI, reload WezTerm and manually check:
 
 For tmux rendering changes, use the isolated-server tests and add a status sample or screenshot to the pull request. Test both default ASCII and opt-in `--unicode`; Unicode mode uses standard glyphs and does not need a Nerd Font. Tmux runs the command on the tmux host, so remote/headless installations need the provider CLI and existing authentication on that host. Tmux tests use an isolated server and clean it up when complete.
 
+To check the optional CCB integration against a compatible source checkout, run:
+
+```sh
+CCB_SOURCE_DIR=/absolute/path/to/claude_code_bridge python3 -m unittest discover -s tests -p test_tmux_quota.py -k ccb
+```
+
+This opt-in test uses CCB's actual theme scripts on a disposable tmux server with fixture quota data and stubbed provider/status commands. It checks the documented setup, live changes, session overrides, repeated reloads, and restoration after exit. It does not install CCB, start providers, or touch the live tmux server. Without `CCB_SOURCE_DIR`, this check is skipped and standalone tmux tests remain independent of CCB.
+
 ## Style
 
 - Lua uses 2-space indentation

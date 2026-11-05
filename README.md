@@ -153,6 +153,45 @@ For paths with spaces, use the fragment printed by `python3 tmux-quota.py --tmux
 
 Do not edit CCB's installed theme scripts: its installer replaces them. If an older personal integration appends the quota through a hook or directly inside the theme, remove that extra append when switching to this option so the quota appears once. Check ordinary tmux, CCB activation, config reloads, and CCB exit after upgrading. This plugin uses the public extension and does not modify CCB's private restore state.
 
+### OpenCode Go
+
+OpenCode Go usage is opt-in and, for now, standalone-tmux only: the WezTerm plugin does not display it yet. Select it with `--providers`, which takes a comma-separated list drawn from `claude`, `codex`, and `opencode-go`:
+
+```sh
+python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers opencode-go
+```
+
+The default invocation is unchanged (`claude,codex`). Providers that are not selected are not fetched and their credentials are not read. OpenCode Go shows three windows: `5h` (rolling), `7d` (weekly), and `mo` (monthly), each with its percentage, bar, and reset countdown. A window the service reports as rate limited keeps its percentage in the high/red colour with a `limited` marker. `not running`, `no key`, `no Go plan`, `syncing`, `unavailable`, and `stale` states match the other providers.
+
+Keep OpenCode Go in its own widget so a Go outage or a missing key cannot change the Claude and Codex display. This reload-safe form appends a second helper invocation exactly once:
+
+```tmux
+if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *opencode-go*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers opencode-go)"'
+```
+
+The helper reads the bearer token from the `OPENCODE_API_KEY` environment variable only; it never takes the key on the command line and never reads a credential file. Either export the variable for the tmux server, which makes it visible to every pane and program that server starts, or wrap the one helper invocation, which keeps the key out of the server environment but pays the wrapper's cost on every status refresh.
+
+To export it, do so before the server starts, because an already-running server keeps the environment it was started with; exporting the variable in a shell afterwards does not reach that server's status commands. Start or restart tmux from a shell that has it set:
+
+```sh
+export OPENCODE_API_KEY="$(your-secret-tool get opencode-go)"
+tmux new-session   # or restart the server
+```
+
+On tmux 3.4, `tmux set-environment -g OPENCODE_API_KEY …` also reaches a running server's status `#()` jobs, which was checked with an attached client; the value stays in the server environment until `set-environment -gu OPENCODE_API_KEY`.
+
+To keep the key out of the server environment entirely, put the vault wrapper inside the status-right fragment itself, with `mcpctl` on the server's `PATH`. This keeps the same reload guard and still appends exactly one widget:
+
+```tmux
+if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *opencode-go*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(mcpctl exec-vault --env OPENCODE_API_KEY=opencode-go-api-main -- python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers opencode-go)"'
+```
+
+When the variable is missing the widget shows `no key` and makes no network request.
+
+The widget appears while any interactive Pi or OpenCode process is running on the tmux host, which is the same process check used for Claude and Codex. That only means one of those tools is open: it does not prove that the running Pi session is using OpenCode Go, and a Go key from a different workspace still reports that workspace's meters. A workspace without a Go subscription returns `no Go plan` rather than an error; rate limiting holds a longer retry delay and shows `syncing` when no safe cached meters are left.
+
+The usage endpoint used here is undocumented upstream and may change without notice; a changed response shape is reported as `unavailable` rather than as fabricated numbers. Three providers need more room than two, so raise `status-right-length` (260 is enough to show all three next to a short clock) and check the line on your narrowest terminal.
+
 ## Configuration
 
 For the WezTerm plugin, pass options to `apply_to_config(config, opts)`:

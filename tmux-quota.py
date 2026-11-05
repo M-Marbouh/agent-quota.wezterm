@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Render process-aware Claude and Codex quotas for a tmux status line."""
+"""Render process-aware Claude, Codex and OpenCode Go quotas for a tmux status line."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import shlex
@@ -22,13 +23,19 @@ from typing import Any
 
 
 API_URL = "https://api.anthropic.com/api/oauth/usage"
+GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+GO_USER_AGENT = "agent-quota-tmux/1.0"
 SUCCESS_TTL = 60
 ERROR_TTL = 30
 RATE_LIMIT_TTL = 300
+NO_PLAN_TTL = 3600
 MAX_ERROR_TTL = 1800
 NETWORK_TIMEOUT = 5
 CODEX_TIMEOUT = 15
 BAR_WIDTH = 8
+PROVIDERS = ("claude", "codex", "opencode-go")
+DEFAULT_PROVIDERS = ("claude", "codex")
+PROVIDER_NAMES = {"claude": "Claude", "codex": "Codex", "opencode-go": "OpenCode Go"}
 
 
 def cache_dir() -> Path:
@@ -95,7 +102,8 @@ class RefreshLock:
             self.fd = None
 
 
-def process_states() -> dict[str, bool]:
+def process_states(providers: tuple[str, ...] = DEFAULT_PROVIDERS) -> dict[str, bool]:
+    requested = [name for name in PROVIDERS if name in providers]
     try:
         result = subprocess.run(
             ["ps", "-eo", "comm=,tty=,args="],
@@ -105,19 +113,23 @@ def process_states() -> dict[str, bool]:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return {"claude": False, "codex": False}
+        return {name: False for name in requested}
 
-    states = {"claude": False, "codex": False}
+    states = {name: False for name in requested}
     for line in result.stdout.splitlines():
         fields = line.strip().split(None, 2)
         if len(fields) < 2:
             continue
         command, tty = fields[0].lower(), fields[1]
         args = fields[2].lower() if len(fields) > 2 else command
-        if command == "claude" and "--chrome-native-host" not in args:
+        if "claude" in states and command == "claude" and "--chrome-native-host" not in args:
             states["claude"] = True
-        if command == "codex" and tty != "?" and "app-server" not in args:
+        if "codex" in states and command == "codex" and tty != "?" and "app-server" not in args:
             states["codex"] = True
+        # Pi and OpenCode both run their TUI under their own comm on a pty. Launchers that
+        # merely mention them (a CCB bridge running as python3) do not count.
+        if "opencode-go" in states and tty != "?" and command in ("pi", "opencode"):
+            states["opencode-go"] = True
     return states
 
 
@@ -195,6 +207,94 @@ def fetch_claude(credentials_path: Path, now: float | None = None) -> dict[str, 
     if not windows:
         return {"status": "error", "error": "Claude response unavailable"}
     return {"status": "ok", "windows": windows, "updated_at": time.time() if now is None else now}
+
+
+def fetch_opencode_go(now: float | None = None) -> dict[str, Any]:
+    key = os.environ.get("OPENCODE_API_KEY")
+    if not isinstance(key, str) or not key.strip():
+        return {"status": "no_key", "error": "OpenCode Go key missing"}
+    request = urllib.request.Request(
+        GO_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {key.strip()}",
+            "Accept": "application/json",
+            "User-Agent": GO_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            # Only OpenCode's own JSON error envelope means "this workspace has no Go plan".
+            # An edge/WAF block (Cloudflare serves a JSON page with title/detail/error_code)
+            # is a transport failure, not a plan statement.
+            if opencode_error_envelope(exc):
+                return {"status": "no_plan"}
+            return {"status": "error", "error": "OpenCode Go request failed"}
+        if exc.code == 429:
+            return {"status": "rate_limited", "error": "OpenCode Go rate limited"}
+        return {"status": "error", "error": "OpenCode Go request failed"}
+    except (OSError, TimeoutError, ValueError, UnicodeError):
+        return {"status": "error", "error": "OpenCode Go request failed"}
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return {"status": "error", "error": "OpenCode Go response unavailable"}
+
+    windows = []
+    for meter_name, label in (("rolling", "5h"), ("weekly", "7d"), ("monthly", "mo")):
+        meter = usage.get(meter_name)
+        if not isinstance(meter, dict):
+            continue
+        meter_status = meter.get("status")
+        if meter_status not in ("ok", "rate-limited"):
+            continue
+        percent = go_percent(meter.get("percent"))
+        reset_at = go_reset_at(meter.get("resetsAt"))
+        if percent is None or reset_at is None:
+            continue
+        window: dict[str, Any] = {"label": label, "percent": percent, "reset_at": reset_at}
+        if meter_status == "rate-limited":
+            window["limited"] = True
+        windows.append(window)
+    if not windows:
+        return {"status": "error", "error": "OpenCode Go response unavailable"}
+    return {"status": "ok", "windows": windows, "updated_at": time.time() if now is None else now}
+
+
+def go_reset_at(value: Any) -> float | None:
+    """Return the meter's reset timestamp only for an ISO-8601 string that parses finitely."""
+    if not isinstance(value, str):
+        return None
+    timestamp = parse_timestamp(value)
+    if timestamp is None or not math.isfinite(timestamp):
+        return None
+    return timestamp
+
+
+def opencode_error_envelope(exc: urllib.error.HTTPError) -> bool:
+    """True when a 403 body is OpenCode's JSON error envelope, not an edge/WAF page."""
+    try:
+        body = exc.read(4096)
+    except (OSError, ValueError, TypeError):
+        return False
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    # OpenCode wraps failures as {"type": "error", "error": {"type": ..., "message": ...}}.
+    # Cloudflare's block page is also JSON, but carries title/detail/error_code and no error object.
+    if not isinstance(payload, dict) or payload.get("cloudflare_error") is True:
+        return False
+    return isinstance(payload.get("error"), dict)
+
+
+def go_percent(value: Any) -> float | None:
+    """Return a finite percentage, rejecting booleans and values outside 0..100."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    percent = float(value)
+    return percent if math.isfinite(percent) and 0 <= percent <= 100 else None
 
 
 def parse_timestamp(value: Any) -> float | None:
@@ -358,6 +458,15 @@ def provider_data(
                     "error_count": error_count,
                     "next_refresh_at": now + retry_delay(error_count),
                 }
+        elif result.get("status") == "no_plan":
+            # A workspace without a Go subscription replaces previous data outright: no stale
+            # meters and no fast retry, because the answer only changes with a new subscription.
+            entry = {
+                "status": "no_plan",
+                "windows": [],
+                "error_count": 0,
+                "next_refresh_at": now + NO_PLAN_TTL,
+            }
         else:
             error_count = prior_error_count(cached) + 1
             retry = retry_delay(error_count, result.get("status") == "rate_limited")
@@ -417,11 +526,11 @@ def styled_provider(
     name: str, data: dict[str, Any], now: float, use_unicode: bool = False
 ) -> str:
     if use_unicode:
-        icon = "⚡" if name == "Claude" else "✦"
+        icon = {"Claude": "⚡", "Codex": "✦", "OpenCode Go": "◈"}.get(name, "✦")
         prefix = f"#[fg=#c0caf5]{icon} {name}:#[default]"
         state_color = "#c0caf5"
     else:
-        icon = "C" if name == "Claude" else "X"
+        icon = {"Claude": "C", "Codex": "X", "OpenCode Go": "O"}.get(name, "?")
         prefix = f"#[fg=colour245]{icon} {name}:#[default]"
         state_color = "colour245"
     status = data.get("status")
@@ -429,6 +538,10 @@ def styled_provider(
         return prefix + f" #[fg={state_color}]not running#[default]"
     if status == "syncing":
         return prefix + f" #[fg={state_color}]syncing#[default]"
+    if status == "no_plan":
+        return prefix + f" #[fg={state_color}]no Go plan#[default]"
+    if status == "no_key":
+        return prefix + f" #[fg={state_color}]no key#[default]"
     windows = data.get("windows") if isinstance(data.get("windows"), list) else []
     if not windows:
         state = "syncing" if status == "rate_limited" else "unavailable"
@@ -442,10 +555,14 @@ def styled_provider(
         percent = window.get("percent")
         if not isinstance(percent, (int, float)):
             continue
+        limited = window.get("limited") is True
+        marker = " limited" if limited else ""
         if use_unicode:
             color = "#9ece6a" if percent < 50 else "#e0af68" if percent < 80 else "#f7768e"
+            percent_color = "#f7768e" if limited else color
         else:
             color = "colour40" if percent < 50 else "colour220" if percent < 80 else "colour196"
+            percent_color = "colour196" if limited else color
         bar = quota_bar(float(percent), use_unicode)
         remaining = countdown(window.get("reset_at"), now)
         if use_unicode:
@@ -454,11 +571,11 @@ def styled_provider(
             timer = f" #[fg=#a9b1d6]({remaining})#[default]" if remaining else ""
             rendered.append(
                 f"#[fg=#c0caf5]{label}#[default] {bar} "
-                f"#[fg={color}]{percent:.0f}%#[default]{timer}"
+                f"#[fg={percent_color}]{percent:.0f}%{marker}#[default]{timer}"
             )
         else:
             suffix = f" ({remaining})" if remaining else ""
-            rendered.append(f"#[fg=colour252]{label} {bar} #[fg={color}]{percent:.0f}%{suffix}#[default]")
+            rendered.append(f"#[fg=colour252]{label} {bar} #[fg={percent_color}]{percent:.0f}%{marker}{suffix}#[default]")
     separator = "  #[fg=#7a83a5]·#[default]  " if use_unicode else "  "
     unavailable_color = "#c0caf5" if use_unicode else "colour245"
     return prefix + (" " + separator.join(rendered) if rendered else f" #[fg={unavailable_color}]unavailable#[default]")
@@ -470,38 +587,96 @@ def render_status(
     codex: dict[str, Any],
     now: float | None = None,
     use_unicode: bool = False,
+    providers: tuple[str, ...] = DEFAULT_PROVIDERS,
+    opencode_go: dict[str, Any] | None = None,
 ) -> str:
     current = time.time() if now is None else now
     separator = "  #[fg=#7a83a5]·#[default]  " if use_unicode else "  #[fg=colour238]|#[default]  "
-    claude_data = claude if states.get("claude") else {"status": "not_running"}
-    codex_data = codex if states.get("codex") else {"status": "not_running"}
-    claude_status = styled_provider("Claude", claude_data, current, use_unicode)
-    codex_status = styled_provider("Codex", codex_data, current, use_unicode)
-    return claude_status + separator + codex_status
+    data = {"claude": claude, "codex": codex, "opencode-go": opencode_go or {}}
+    rendered = []
+    for name in PROVIDERS:
+        if name not in providers:
+            continue
+        entry = data[name] if states.get(name) else {"status": "not_running"}
+        rendered.append(styled_provider(PROVIDER_NAMES[name], entry, current, use_unicode))
+    return separator.join(rendered)
 
 
-def run_status(use_unicode: bool = False) -> str:
+def run_status(use_unicode: bool = False, providers: tuple[str, ...] = DEFAULT_PROVIDERS) -> str:
     now = time.time()
-    states = process_states()
+    selected = tuple(name for name in PROVIDERS if name in providers)
+    states = process_states(selected)
     root = cache_dir()
     helper = Path(__file__).with_name("codex-limits.py")
-    claude = provider_data("claude", states["claude"], now, lambda: fetch_claude(Path.home() / ".claude/.credentials.json", now), root)
-    codex = provider_data("codex", states["codex"], now, lambda: fetch_codex(helper), root)
-    return render_status(states, claude, codex, now, use_unicode)
+    data: dict[str, dict[str, Any]] = {}
+    for name in selected:
+        active = states.get(name, False)
+        if name == "claude":
+            data[name] = provider_data(
+                "claude", active, now,
+                lambda: fetch_claude(Path.home() / ".claude/.credentials.json", now), root,
+            )
+        elif name == "codex":
+            data[name] = provider_data("codex", active, now, lambda: fetch_codex(helper), root)
+        else:
+            data[name] = provider_data("opencode-go", active, now, lambda: fetch_opencode_go(now), root)
+    return render_status(
+        states,
+        data.get("claude", {}),
+        data.get("codex", {}),
+        now,
+        use_unicode,
+        selected,
+        data.get("opencode-go"),
+    )
 
 
-def tmux_command(path: Path, use_unicode: bool = False) -> str:
+def parse_providers(value: str) -> tuple[str, ...]:
+    names = [part.strip() for part in value.split(",") if part.strip()]
+    if not names:
+        raise ValueError("--providers needs at least one of: " + ", ".join(PROVIDERS))
+    unknown = [name for name in names if name not in PROVIDERS]
+    if unknown:
+        raise ValueError(
+            "unknown provider(s): " + ", ".join(unknown) + "; choose from: " + ", ".join(PROVIDERS)
+        )
+    return tuple(name for name in PROVIDERS if name in names)
+
+
+def tmux_command(
+    path: Path, use_unicode: bool = False, providers: tuple[str, ...] = DEFAULT_PROVIDERS
+) -> str:
     flag = " --unicode" if use_unicode else ""
-    return "#(python3 " + shlex.quote(str(path.resolve())) + flag + ")"
+    selected = tuple(name for name in PROVIDERS if name in providers)
+    provider_flag = ""
+    if selected and selected != DEFAULT_PROVIDERS:
+        provider_flag = " --providers " + shlex.quote(",".join(selected))
+    return "#(python3 " + shlex.quote(str(path.resolve())) + flag + provider_flag + ")"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmux-command", action="store_true", help="print a status-right command for this file")
     parser.add_argument("--unicode", action="store_true", help="render tmux-native Unicode icons and usage bars")
+    parser.add_argument(
+        "--providers",
+        default=",".join(DEFAULT_PROVIDERS),
+        help="comma-separated providers to show: " + ", ".join(PROVIDERS)
+        + " (default: " + ",".join(DEFAULT_PROVIDERS) + ")",
+    )
     args = parser.parse_args()
     try:
-        print(tmux_command(Path(__file__), args.unicode) if args.tmux_command else run_status(args.unicode))
+        selected = parse_providers(args.providers)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
+        if args.tmux_command:
+            print(tmux_command(Path(__file__), args.unicode, selected))
+        elif selected == DEFAULT_PROVIDERS:
+            # The default path keeps its original single-argument call.
+            print(run_status(args.unicode))
+        else:
+            print(run_status(args.unicode, selected))
     except Exception:
         print("#[fg=colour245]Quota unavailable#[default]")
     return 0

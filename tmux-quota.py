@@ -26,6 +26,7 @@ from typing import Any
 API_URL = "https://api.anthropic.com/api/oauth/usage"
 GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 GO_USER_AGENT = "agent-quota-tmux/1.0"
+GO_AUTH_MAX_BYTES = 1024 * 1024
 SUCCESS_TTL = 60
 ERROR_TTL = 30
 RATE_LIMIT_TTL = 300
@@ -234,6 +235,11 @@ def validated_go_key(raw: bytes) -> str | None:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    return validated_go_key_text(text)
+
+
+def validated_go_key_text(text: str) -> str | None:
+    """The same rules as validated_go_key, for a key that is already decoded text."""
     if text.endswith("\n"):
         text = text[:-1]
         if text.endswith("\r"):
@@ -269,14 +275,47 @@ def opencode_key_command_key(command: str) -> str | None:
     return validated_go_key(completed.stdout or b"")
 
 
+def go_auth_path() -> Path:
+    """OpenCode's saved login file; XDG_DATA_HOME counts only when it is absolute."""
+    configured = os.environ.get("XDG_DATA_HOME")
+    root = Path(configured) if isinstance(configured, str) and os.path.isabs(configured) else None
+    base = root if root is not None else Path.home() / ".local/share"
+    return base / "opencode" / "auth.json"
+
+
+def saved_go_key(path: Path | None = None) -> str | None:
+    """The Go API key from an OpenCode API-key login, or None. Fails closed."""
+    target = go_auth_path() if path is None else path
+    try:
+        with target.open("rb") as stream:
+            raw = stream.read(GO_AUTH_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if len(raw) > GO_AUTH_MAX_BYTES:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    entry = payload.get("opencode-go")
+    if not isinstance(entry, dict) or entry.get("type") != "api":
+        return None
+    key = entry.get("key")
+    if not isinstance(key, str):
+        return None
+    return validated_go_key_text(key)
+
+
 def opencode_go_key(command: str | None) -> str | None:
-    """Resolve the bearer key: a non-blank environment key wins over the command."""
+    """Resolve the bearer key: environment, then the command, then a saved login."""
     env_key = opencode_env_key()
     if env_key is not None:
         return env_key
     if command:
         return opencode_key_command_key(command)
-    return None
+    return saved_go_key()
 
 
 def fetch_opencode_go(now: float | None = None, key_command: str | None = None) -> dict[str, Any]:
@@ -949,7 +988,9 @@ def main() -> int:
         "--opencode-key-command",
         default=None,
         metavar="CMD",
-        help="command whose first output line is the OpenCode Go key when OPENCODE_API_KEY is unset",
+        help="command whose first output line is the OpenCode Go key; a non-blank "
+        "OPENCODE_API_KEY wins over it, it runs only when no environment key is usable, "
+        "and a failing command never falls back to a saved OpenCode login",
     )
     parser.add_argument(
         "--hide-inactive",

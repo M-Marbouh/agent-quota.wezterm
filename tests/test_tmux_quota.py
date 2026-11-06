@@ -847,6 +847,7 @@ GO_FIXTURE = {
     }
 }
 GO_KEY = "opencode-go-leak-control-6b2f4a17"
+MISSING_SAVED_LOGIN = Path("/nonexistent/tmux-quota-auth.json")
 NO_PLAN_403 = json.dumps({"type": "error", "error": {"type": "SubscriptionError", "message": "No Go plan"}}).encode()
 CLOUDFLARE_403_JSON = json.dumps({
     "type": "https://developers.cloudflare.com/support/troubleshooting/http-status-codes/"
@@ -886,6 +887,8 @@ class OpenCodeGoTests(unittest.TestCase):
         if body is None:
             body = json.dumps(GO_FIXTURE if payload is None else payload).encode()
         with self._env(key), mock.patch.object(
+            quota, "go_auth_path", return_value=MISSING_SAVED_LOGIN
+        ), mock.patch.object(
             quota.urllib.request, "urlopen", side_effect=error, return_value=self._response(body)
         ) as urlopen:
             result = quota.fetch_opencode_go(now)
@@ -1496,6 +1499,7 @@ class OpenCodeKeyCommandTests(unittest.TestCase):
 
     def test_blank_environment_key_without_a_command_still_reports_no_key(self):
         with self._env("  "), \
+             mock.patch.object(quota, "go_auth_path", return_value=MISSING_SAVED_LOGIN), \
              mock.patch.object(quota.subprocess, "run") as run, \
              mock.patch.object(quota.urllib.request, "urlopen") as urlopen:
             data = quota.fetch_opencode_go(100)
@@ -1580,6 +1584,307 @@ class OpenCodeKeyCommandTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(quota.main(), 0)
         default_run.assert_called_once_with(False)
+
+
+SAVED_LOGIN_KEY = "sk-go-api-4f8c2a1d9b7e5f4c0a6d2e8b1c3f5a7d9e0b2c4d6"
+SAVED_LOGIN_FIXTURE = {
+    "openai": {
+        "type": "oauth",
+        "access": "saved-oauth-access-1f2e3d",
+        "refresh": "saved-oauth-refresh-4c5b6a",
+        "expires": 1893456000000,
+        "accountId": "saved-oauth-account-7d8e9f",
+    },
+    "opencode-go": {"type": "api", "key": SAVED_LOGIN_KEY},
+}
+NO_KEY = {"status": "no_key", "error": "OpenCode Go key missing"}
+
+
+class OpenCodeSavedLoginTests(unittest.TestCase):
+    """The key OpenCode saved for an OpenCode Go API-key login."""
+
+    def test_deeply_nested_saved_login_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "auth.json"
+            path.write_text("[" * 200000 + "]" * 200000)
+            self.assertIsNone(quota.saved_go_key(path))
+
+    COMMAND = "mcpctl vault get opencode-go-api-main"
+    COMMAND_KEY = "command-supplied-key-5c1e9a7d3b2f80461c8d5e9a"
+
+    @staticmethod
+    def _response(body):
+        return OpenCodeGoTests._response(body)
+
+    @staticmethod
+    def _render(data):
+        return quota.render_status(
+            {"opencode-go": True}, {}, {}, now=100,
+            providers=("opencode-go",), opencode_go=data,
+        )
+
+    @staticmethod
+    def _completed(stdout=b"", returncode=0):
+        return subprocess.CompletedProcess([], returncode, stdout, b"")
+
+    @contextlib.contextmanager
+    def _isolated_env(self, home, data_home=None):
+        environment = {
+            name: value for name, value in os.environ.items() if name != "OPENCODE_API_KEY"
+        }
+        environment["HOME"] = str(home)
+        if data_home is None:
+            environment.pop("XDG_DATA_HOME", None)
+        else:
+            environment["XDG_DATA_HOME"] = str(data_home)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            yield
+
+    @contextlib.contextmanager
+    def _saved_login_reads(self):
+        """A login path that fails the test loudly if anything opens it."""
+        path = mock.MagicMock(name="saved-login-path")
+        path.open.side_effect = AssertionError("the saved login must not be read here")
+        with mock.patch.object(quota, "go_auth_path", return_value=path):
+            yield path
+
+    def _write_login(self, data_home, payload):
+        path = Path(data_home) / "opencode" / "auth.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, (bytes, bytearray)):
+            path.write_bytes(payload)
+        else:
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(path, 0o600)
+        return path
+
+    def test_saved_api_login_supplies_the_bearer_token_without_leaking_it(self):
+        self.assertEqual(len(SAVED_LOGIN_KEY), 51)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_home = root / "xdg"
+            auth = self._write_login(data_home, SAVED_LOGIN_FIXTURE)
+            self.assertEqual(auth.stat().st_mode & 0o777, 0o600)
+            cache = root / "cache"
+            with self._isolated_env(root / "home", data_home), \
+                 mock.patch.object(
+                     quota.urllib.request, "urlopen",
+                     return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                 ) as urlopen:
+                data = quota.provider_data(
+                    "opencode-go", True, 100, lambda: quota.fetch_opencode_go(100), cache,
+                )
+            cache_text = (cache / "opencode-go.json").read_text()
+            rendered = self._render(data)
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(len(data["windows"]), 3)
+        urlopen.assert_called_once()
+        request = urlopen.call_args[0][0]
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {SAVED_LOGIN_KEY}")
+        self.assertEqual(request.get_header("User-agent"), quota.GO_USER_AGENT)
+        for where, haystack in {
+            "cache file": cache_text,
+            "result": repr(data),
+            "serialized": json.dumps(data),
+            "rendered": rendered,
+        }.items():
+            self.assertNotIn(SAVED_LOGIN_KEY, haystack, where)
+            self.assertNotIn("saved-oauth", haystack, where)
+
+    def test_one_trailing_line_ending_is_accepted_like_the_key_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_home = root / "xdg"
+            self._write_login(data_home, {
+                "opencode-go": {"type": "api", "key": SAVED_LOGIN_KEY + "\n"},
+            })
+            with self._isolated_env(root / "home", data_home), \
+                 mock.patch.object(
+                     quota.urllib.request, "urlopen",
+                     return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                 ) as urlopen:
+                data = quota.fetch_opencode_go(100)
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(
+            urlopen.call_args[0][0].get_header("Authorization"), f"Bearer {SAVED_LOGIN_KEY}"
+        )
+
+    def test_environment_key_wins_and_never_opens_the_saved_login(self):
+        with self._saved_login_reads() as saved, \
+             mock.patch.object(quota.subprocess, "run") as run, \
+             mock.patch.object(
+                 quota.urllib.request, "urlopen",
+                 return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+             ) as urlopen, \
+             OpenCodeGoTests._env(GO_KEY):
+            data = quota.fetch_opencode_go(100)
+        self.assertEqual(data["status"], "ok")
+        run.assert_not_called()
+        urlopen.assert_called_once()
+        self.assertEqual(urlopen.call_args[0][0].get_header("Authorization"), f"Bearer {GO_KEY}")
+        saved.open.assert_not_called()
+
+    def test_key_command_wins_and_never_opens_the_saved_login(self):
+        with self._saved_login_reads() as saved, \
+             mock.patch.object(
+                 quota.subprocess, "run", return_value=self._completed(self.COMMAND_KEY.encode() + b"\n"),
+             ) as run, \
+             mock.patch.object(
+                 quota.urllib.request, "urlopen",
+                 return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+             ) as urlopen, \
+             OpenCodeGoTests._env(None):
+            data = quota.fetch_opencode_go(100, self.COMMAND)
+        self.assertEqual(data["status"], "ok")
+        run.assert_called_once()
+        urlopen.assert_called_once()
+        self.assertEqual(
+            urlopen.call_args[0][0].get_header("Authorization"), f"Bearer {self.COMMAND_KEY}"
+        )
+        saved.open.assert_not_called()
+
+    def test_failing_key_command_does_not_fall_back_to_the_saved_login(self):
+        cases = {
+            "nonzero exit": {"return_value": self._completed(b"", 2)},
+            "missing executable": {"side_effect": FileNotFoundError("missing")},
+            "timeout": {"side_effect": subprocess.TimeoutExpired(self.COMMAND, 5)},
+            "empty output": {"return_value": self._completed(b"")},
+        }
+        for label, run_kwargs in cases.items():
+            with self.subTest(case=label):
+                with self._saved_login_reads() as saved, \
+                     mock.patch.object(quota.subprocess, "run", **run_kwargs) as run, \
+                     mock.patch.object(quota.urllib.request, "urlopen") as urlopen, \
+                     OpenCodeGoTests._env(None):
+                    data = quota.fetch_opencode_go(100, self.COMMAND)
+                self.assertEqual(data, NO_KEY)
+                run.assert_called_once()
+                urlopen.assert_not_called()
+                saved.open.assert_not_called()
+
+    def test_saved_login_is_not_opened_when_the_key_is_not_needed(self):
+        fresh = {"status": "ok", "windows": [{"label": "5h", "percent": 10, "reset_at": 5000}]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self._saved_login_reads() as saved, \
+                 mock.patch.object(quota, "cache_dir", return_value=root), \
+                 mock.patch.object(
+                     quota.urllib.request, "urlopen",
+                     return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                 ) as urlopen, \
+                 mock.patch.object(quota, "fetch_claude", return_value=fresh), \
+                 mock.patch.object(quota.time, "time", return_value=1):
+                with mock.patch.object(quota, "process_states", return_value={"claude": True}):
+                    unselected = quota.run_status(providers=("claude",))
+                self.assertIn("Claude", unselected)
+                self.assertNotIn("OpenCode", unselected)
+                inactive = quota.provider_data(
+                    "opencode-go", False, 1, lambda: quota.fetch_opencode_go(1), root,
+                )
+                self.assertEqual(inactive["status"], "not_running")
+                (root / "opencode-go.json").write_text(json.dumps({
+                    **fresh, "next_refresh_at": 10_000, "error_count": 0,
+                }))
+                cached = quota.provider_data(
+                    "opencode-go", True, 1, lambda: quota.fetch_opencode_go(1), root,
+                )
+                self.assertEqual(cached["status"], "ok")
+                self.assertEqual(cached["next_refresh_at"], 10_000)
+                (root / "opencode-go.json").unlink()
+                with quota.RefreshLock(root / "opencode-go.lock") as held:
+                    self.assertTrue(held)
+                    locked = quota.provider_data(
+                        "opencode-go", True, 1, lambda: quota.fetch_opencode_go(1), root,
+                    )
+                self.assertEqual(locked["status"], "syncing")
+            urlopen.assert_not_called()
+        saved.open.assert_not_called()
+
+    def test_malformed_saved_logins_fail_closed_without_http(self):
+        key = SAVED_LOGIN_KEY.encode()
+        oversized = (
+            b'{"opencode-go":{"type":"api","key":"' + key + b'","pad":"'
+            + b"x" * quota.GO_AUTH_MAX_BYTES + b'"}}'
+        )
+        cases = {
+            "empty file": b"",
+            "invalid json": b'{"opencode-go": ',
+            "trailing garbage": b'{"opencode-go":{"type":"api","key":"k"}} {}',
+            "json array": b'[{"opencode-go":{"type":"api","key":"' + key + b'"}}]',
+            "json null": b"null",
+            "json string": b'"opencode-go"',
+            "json number": b"42",
+            "missing entry": b'{"openai":{"type":"oauth","access":"saved-oauth-access"}}',
+            "oauth type": b'{"opencode-go":{"type":"oauth","key":"secret"}}',
+            "missing type": b'{"opencode-go":{"key":"' + key + b'"}}',
+            "capitalized type": b'{"opencode-go":{"type":"API","key":"' + key + b'"}}',
+            "entry not an object": b'{"opencode-go":"' + key + b'"}',
+            "key non-string": b'{"opencode-go":{"type":"api","key":1234567890}}',
+            "key empty": b'{"opencode-go":{"type":"api","key":""}}',
+            "key newline": b'{"opencode-go":{"type":"api","key":"abc\\ndef"}}',
+            "key carriage return": b'{"opencode-go":{"type":"api","key":"abc\\rdef"}}',
+            "key control character": b'{"opencode-go":{"type":"api","key":"abc\\u0007def"}}',
+            "key leading space": b'{"opencode-go":{"type":"api","key":" abc"}}',
+            "key trailing space": b'{"opencode-go":{"type":"api","key":"abc "}}',
+            "key invalid utf-8": b'{"opencode-go":{"type":"api","key":"\xff\xfe"}}',
+            "oversized file": oversized,
+        }
+        for label, payload in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                data_home = root / "xdg"
+                self._write_login(data_home, payload)
+                with self._isolated_env(root / "home", data_home), \
+                     mock.patch.object(quota.urllib.request, "urlopen") as urlopen:
+                    data = quota.fetch_opencode_go(100)
+                self.assertEqual(data, NO_KEY, label)
+                urlopen.assert_not_called()
+
+    def test_missing_login_and_login_directory_report_no_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label in ("missing file", "directory instead of file"):
+                with self.subTest(case=label):
+                    data_home = root / label.replace(" ", "-")
+                    if label.startswith("directory"):
+                        (data_home / "opencode" / "auth.json").mkdir(parents=True)
+                    with self._isolated_env(root / "home", data_home), \
+                         mock.patch.object(quota.urllib.request, "urlopen") as urlopen:
+                        data = quota.fetch_opencode_go(100)
+                    self.assertEqual(data, NO_KEY)
+                    urlopen.assert_not_called()
+
+    def test_relative_or_empty_xdg_data_home_uses_the_default_location(self):
+        for configured in ("relative/data", ""):
+            with self.subTest(xdg=repr(configured)), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "home"
+                default_auth = home / ".local" / "share" / "opencode" / "auth.json"
+                default_auth.parent.mkdir(parents=True)
+                default_auth.write_text(json.dumps(SAVED_LOGIN_FIXTURE), encoding="utf-8")
+                workdir = root / "work"
+                (workdir / "relative/data/opencode").mkdir(parents=True)
+                (workdir / "relative/data/opencode/auth.json").write_text(
+                    json.dumps({"opencode-go": {"type": "oauth"}}), encoding="utf-8"
+                )
+                previous = Path.cwd()
+                os.chdir(workdir)
+                try:
+                    with self._isolated_env(home, configured), \
+                         mock.patch.object(
+                             quota.urllib.request, "urlopen",
+                             return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                         ) as urlopen:
+                        self.assertEqual(quota.go_auth_path(), default_auth)
+                        data = quota.fetch_opencode_go(100)
+                finally:
+                    os.chdir(previous)
+                self.assertEqual(data["status"], "ok")
+                urlopen.assert_called_once()
+                self.assertEqual(
+                    urlopen.call_args[0][0].get_header("Authorization"),
+                    f"Bearer {SAVED_LOGIN_KEY}",
+                )
 
 
 class HideInactiveTests(unittest.TestCase):
@@ -1671,12 +1976,21 @@ class HideInactiveTests(unittest.TestCase):
                     self.assertFalse(visible.endswith(separator.strip()))
                     self.assertNotIn(separator.strip() + " " + separator.strip(), visible)
 
-    def test_omitting_the_flag_matches_head_bytes(self):
+    # A fixed commit, not HEAD: after this change is committed, HEAD would compare the
+    # implementation against itself and the test would stop catching regressions. This is the
+    # last commit before --hide-inactive, so it still exposes the layout-aware render_status
+    # this test drives; 3eb7215 predates --layout/--max-width and cannot be called with them.
+    BASELINE_COMMIT = "507e516"
+
+    def test_omitting_the_flag_matches_baseline_bytes(self):
+        baseline = subprocess.run(
+            ["git", "show", f"{self.BASELINE_COMMIT}:tmux-quota.py"],
+            cwd=str(SOURCE.parent), capture_output=True, text=True, check=False,
+        )
+        if baseline.returncode != 0 or not baseline.stdout:
+            self.skipTest(f"baseline commit {self.BASELINE_COMMIT} is not available here")
         head_source = Path(tempfile.gettempdir()) / f"head-quota-hide-inactive-{os.getpid()}.py"
-        head_source.write_text(subprocess.run(
-            ["git", "show", "HEAD:tmux-quota.py"], cwd=str(SOURCE.parent),
-            capture_output=True, text=True, check=True,
-        ).stdout)
+        head_source.write_text(baseline.stdout)
         try:
             spec = importlib.util.spec_from_file_location("head_quota_hide", head_source)
             head = importlib.util.module_from_spec(spec)

@@ -1535,6 +1535,17 @@ local function dense_state_text(state)
   return "?"
 end
 
+-- Same precedence as tmux's state_marker(): these states replace the numbers even when
+-- the cache still holds windows, so a lost key after a successful read never shows
+-- stale percentages in WezTerm while tmux says `no key`.
+local function dense_marker(state, window_count)
+  if window_count > 0
+    and state ~= "syncing" and state ~= "no_plan" and state ~= "no_key" then
+    return nil
+  end
+  return dense_state_text(state)
+end
+
 local function dense_provider(icon, name, report, layout, now)
   if report.state == "not_running" then
     return DIM .. icon .. " " .. name .. ":"
@@ -1546,8 +1557,9 @@ local function dense_provider(icon, name, report, layout, now)
   end
 
   local windows = report.windows
-  if #windows == 0 then
-    return head .. " " .. BRIGHT .. dense_state_text(report.state) .. RESET
+  local marker = dense_marker(report.state, #windows)
+  if marker then
+    return head .. " " .. BRIGHT .. marker .. RESET
   end
 
   if layout == "minimal" then
@@ -1576,24 +1588,29 @@ end
 
 -- OpenCode Go in the legacy full style: bars, parenthesised countdowns.
 local function full_go_str(report, now)
+  local state = report and report.state or "unavailable"
   local gi = " " .. (config.icons.opencode_go or "◈") .. " "
   local head = DIM .. gi .. BRIGHT .. "OpenCode Go: "
   local windows = report and report.windows or {}
 
+  -- styled_provider() returns these states before drawing anything, windows included.
+  if state == "not_running" then
+    return head .. DIM .. "not running"
+  elseif state == "syncing" then
+    return head .. DIM .. "syncing..."
+  elseif state == "no_plan" then
+    return head .. DIM .. "no Go plan"
+  elseif state == "no_key" then
+    return head .. DIM .. "no key"
+  end
+
   if #windows == 0 then
-    local state = report and report.state or "unavailable"
     local text
-    if state == "not_running" then
-      text = "not running"
-    elseif state == "unsupported" then
+    if state == "unsupported" then
       text = "not supported on Windows"
-    elseif state == "no_key" then
-      text = "no key"
-    elseif state == "no_plan" then
-      text = "no Go plan"
     elseif state == "ready" then
       text = "ready"
-    elseif state == "syncing" or state == "rate_limited" then
+    elseif state == "rate_limited" then
       text = "syncing..."
     else
       text = "unavailable"
@@ -1618,7 +1635,7 @@ local function full_go_str(report, now)
       segment = segment .. RED .. " limited"
     end
     local remaining = countdown_unix(window.reset_at, now)
-    if remaining then
+    if remaining and not config.compact then
       segment = segment .. DIM .. " (" .. remaining .. ")"
     end
     parts[#parts + 1] = segment

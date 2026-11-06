@@ -98,8 +98,8 @@ CODEX_FIXTURES = {
 
 
 def plain(text):
-    """The rendered text with ANSI colour escapes removed."""
-    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+    """The visible text: ANSI colour escapes (WezTerm) and #[...] styles (tmux) removed."""
+    return re.sub(r"#\[[^\]]*\]", "", re.sub(r"\x1b\[[0-9;]*m", "", text))
 
 
 def to_lua(lua, value):
@@ -288,6 +288,16 @@ with mock.patch.object(subprocess, "run", fake_run), \\
         self.assertEqual(len(report["providers"][0]["windows"]), 3)
         return completed.stdout.strip()
 
+    def mutated_plugin(self, replacements):
+        """A copy of the plugin with exact source substitutions applied."""
+        source = PLUGIN.read_text(encoding="utf-8")
+        for old, new in replacements:
+            self.assertIn(old, source)
+            source = source.replace(old, new)
+        path = self.tmp / f"mutated-{uuid.uuid4().hex[:8]}.lua"
+        path.write_text(source, encoding="utf-8")
+        return path
+
     def spawns(self, needle="tmux-quota.py"):
         return [args for args in self.calls if needle in " ".join(args)]
 
@@ -439,6 +449,127 @@ with mock.patch.object(subprocess, "run", fake_run), \\
                     text = plain(self.build(lua, module, {"not_running": True}))
                     self.assertIn("OpenCode Go:", text)
                     self.assertIn(dense if layout == "compact" else full, text)
+
+    def test_cached_windows_with_a_missing_key_follow_the_tmux_state_text(self):
+        """A good read, then the key disappears: tmux and WezTerm must agree on `no key`."""
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(GO_FIXTURE).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(quota, "cache_dir", return_value=root), \
+                 mock.patch.object(quota, "process_states", return_value={"opencode-go": True}), \
+                 mock.patch.object(quota.time, "time", return_value=NOW), \
+                 mock.patch.dict(os.environ, {"OPENCODE_API_KEY": GO_KEY}), \
+                 mock.patch.object(quota.urllib.request, "urlopen", return_value=response):
+                good = quota.provider_data(
+                    "opencode-go", True, NOW, lambda: quota.fetch_opencode_go(NOW), root,
+                )
+            with mock.patch.object(quota, "cache_dir", return_value=root), \
+                 mock.patch.object(quota, "process_states", return_value={"opencode-go": True}), \
+                 mock.patch.object(quota.time, "time", return_value=NOW + 61), \
+                 mock.patch.object(
+                     quota, "go_auth_path", return_value=Path("/nonexistent/tmux-quota-auth.json")
+                 ), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(quota.urllib.request, "urlopen") as urlopen:
+                data = quota.provider_data(
+                    "opencode-go", True, NOW + 61,
+                    lambda: quota.fetch_opencode_go(NOW + 61), root,
+                )
+        self.assertEqual(good["status"], "ok")
+        self.assertEqual(len(good["windows"]), 3)
+        self.assertEqual(data["status"], "no_key")
+        self.assertIs(data["stale"], True)
+        self.assertEqual(len(data["windows"]), 3)
+        urlopen.assert_not_called()
+
+        self.go_stdout = self.go_stdout_for(data)
+        for layout in ("full", "compact", "minimal"):
+            with self.subTest(layout=layout):
+                expected = plain(quota.render_status(
+                    {"opencode-go": True}, {}, {}, now=NOW + 61, use_unicode=True,
+                    providers=("opencode-go",), opencode_go=data, layout=layout,
+                )).strip()
+                self.assertIn("no key", expected)
+                self.assertNotIn("%", expected)
+                options = self.opts(
+                    layout=layout, hide_inactive=True, opencode_go={"enabled": True},
+                )
+                lua, module = self.load(opts=options)
+                self.prime_codex(CODEX_OK)
+                self.codex_running = False
+                visible = plain(
+                    self.build(lua, module, {"not_running": True}, now=NOW + 61)
+                ).strip()
+                self.assertEqual(visible, expected)
+
+                # Negative control: reverting this layout's precedence fix shows the
+                # cached percentages instead of the state text.
+                reverted = self.mutated_plugin(self.state_precedence_revert(layout))
+                lua, module = self.load(source=reverted, opts=options)
+                self.prime_codex(CODEX_OK)
+                self.codex_running = False
+                visible = plain(
+                    self.build(lua, module, {"not_running": True}, now=NOW + 61)
+                ).strip()
+                self.assertNotEqual(visible, expected)
+                self.assertIn("%", visible)
+
+    def state_precedence_revert(self, layout):
+        if layout == "full":
+            return [(
+                '  elseif state == "no_key" then\n    return head .. DIM .. "no key"\n  end',
+                '  elseif state == "no_key" and #windows == 0 then\n'
+                '    return head .. DIM .. "no key"\n  end',
+            )]
+        return [(
+            '  if window_count > 0\n'
+            '    and state ~= "syncing" and state ~= "no_plan" and state ~= "no_key" then\n'
+            '    return nil\n  end',
+            '  if window_count > 0 then\n    return nil\n  end',
+        )]
+
+    def test_legacy_compact_hides_go_countdowns_in_both_full_layouts(self):
+        self.go_stdout = self.go_stdout_for({
+            "status": "ok",
+            "windows": [
+                {"label": "5h", "percent": 40, "reset_at": NOW + 9840},
+                {"label": "7d", "percent": 20, "reset_at": NOW + 201_500},
+            ],
+        })
+        for layout in (None, "full"):
+            for compact in (False, True):
+                with self.subTest(layout=layout, compact=compact):
+                    options = self.opts(compact=compact, opencode_go={"enabled": True})
+                    if layout:
+                        options["layout"] = layout
+                    lua, module = self.load(opts=options)
+                    self.prime_codex(CODEX_OK)
+                    visible = plain(self.build(lua, module, CLAUDE_OK))
+                    go_part = visible.split("OpenCode Go:")[1]
+                    self.assertIn("40%", go_part)
+                    if compact:
+                        self.assertNotIn("(", visible)
+                        self.assertNotIn("2h44m", go_part)
+                    else:
+                        self.assertIn("(2h44m)", go_part)
+
+        # Negative control: without the guard the Go countdown survives compact mode.
+        reverted = self.mutated_plugin([(
+            '    if remaining and not config.compact then\n'
+            '      segment = segment .. DIM .. " (" .. remaining .. ")"',
+            '    if remaining then\n'
+            '      segment = segment .. DIM .. " (" .. remaining .. ")"',
+        )])
+        for layout in (None, "full"):
+            with self.subTest(control=layout):
+                options = self.opts(compact=True, opencode_go={"enabled": True})
+                if layout:
+                    options["layout"] = layout
+                lua, module = self.load(source=reverted, opts=options)
+                self.prime_codex(CODEX_OK)
+                visible = plain(self.build(lua, module, CLAUDE_OK))
+                self.assertIn("(2h44m)", visible)
 
     def test_malformed_json_shows_an_unavailable_state_and_keeps_other_providers(self):
         for label, stdout, ok in (

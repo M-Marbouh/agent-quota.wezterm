@@ -589,7 +589,7 @@ class TmuxIntegrationTests(unittest.TestCase):
             scripts.mkdir()
             for name in ("ccb-tmux-on.sh", "ccb-tmux-off.sh"):
                 shutil.copy2(ccb / "config" / name, scripts / name)
-            for name, output in (("ccb", "vFIXTURE"), ("ccb-status.sh", "CCB_FIXTURE"), ("ccb-git.sh", "branch"), ("ccb-border.sh", "")):
+            for name, output in (("ccb", "vFIXTURE"), ("ccb-status.sh", "CCB_FIXTURE"), ("ccb-activity.py", "CCB_FIXTURE"), ("ccb-git.sh", "branch"), ("ccb-border.sh", "")):
                 path = scripts / name
                 path.write_text(f"#!/bin/sh\nprintf '%s' {shlex.quote(output)}\n")
                 path.chmod(0o700)

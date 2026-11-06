@@ -4,7 +4,7 @@
 
 [Listed on Awesome WezTerm](https://github.com/michaelbrusegard/awesome-wezterm#ai)
 
-A WezTerm plugin that shows Claude and Codex quota usage directly in the status bar.
+A WezTerm plugin that shows Claude and Codex quota usage directly in the status bar, with opt-in OpenCode Go usage on Unix hosts.
 An optional standalone tmux status command provides the same account view on the machine running tmux, including remote and headless tmux servers.
 
 **Works with [CCB](https://github.com/M-Marbouh/claude_code_bridge).** See the [optional CCB setup](#ccb-integration) for the required status-bar configuration.
@@ -25,6 +25,8 @@ It displays live usage windows returned by each provider, reset countdowns, proc
 - Optional Claude usage dashboard shortcut
 - Configurable status-bar side, icons, polling interval, and bar glyphs
 - Optional tmux integration with an independent cache and no WezTerm dependency
+- Optional `compact` and `minimal` layouts plus inactive-provider hiding in WezTerm, matching the tmux dense layouts
+- Opt-in OpenCode Go usage in WezTerm on Unix hosts, bridged through the same tmux helper and cache
 
 Example output:
 
@@ -42,6 +44,7 @@ Choose the requirements for the integration you use; the standalone tmux command
 - Python 3 (`python3` on Linux, or `python`/`python3` on Windows)
 - `curl`; Linux also needs `pgrep`, `ps`, `mkdir`, `rmdir`, and GNU `stat`; Windows uses bundled `tasklist` for process detection
 - [Claude Code](https://code.claude.com/docs/en/setup) and/or [Codex CLI](https://github.com/openai/codex) installed and authenticated for the provider(s) you want to display
+- For OpenCode Go in WezTerm only: a Unix host with `python3` and this repo's `tmux-quota.py` helper (see [Layouts, inactive providers and OpenCode Go](#layouts-inactive-providers-and-opencode-go))
 
 ### Standalone tmux command
 
@@ -182,6 +185,16 @@ Run it once only; a second run adds the flag again. Check the result with `tmux 
 
 This detects running tools on the tmux host, not connected accounts: Claude counts as running only while a `claude` process runs in a terminal, Codex only while `codex` runs, and OpenCode Go whenever a `pi` or `opencode` TUI is open, even when that session is not using OpenCode Go. A hidden provider is also never fetched, so no credential file is read and no key command runs for it. A provider that *is* running but has no usable data still renders its state (`no key`, `syncing`, `unavailable`, `no plan`, or `~` on stale data). When every selected provider is inactive the widget renders nothing at all, which keeps the status line clean. Check what would be hidden by running the helper once with the flag before adding it to your configuration; `python3 tmux-quota.py --tmux-command --hide-inactive` prints the fragment for you.
 
+#### Machine-readable output
+
+`--json` prints exactly one JSON object instead of the tmux status line, for machine consumers such as the WezTerm plugin:
+
+```sh
+python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --json --providers claude,codex,opencode-go
+```
+
+The object is `{"version":1,"providers":[...]}`, one entry per selected provider in the usual order, each with `name`, `state` (one of `ok`, `not_running`, `syncing`, `no_plan`, `no_key`, `rate_limited`, `unavailable`, `error`), `stale`, and `windows` (`label`, `percent`, `reset_at` or `null`, `limited`). It goes through the same fetches, cache, backoff and key resolution as the status line, never contains credentials, error strings or tmux style codes, and ignores `--layout` and `--hide-inactive`. A runtime failure still prints the documented shape with `"state": "error"` and exits 0, so a consumer can always parse the output.
+
 Other tmux themes may replace `status-right` after this command is added. Use the theme's supported extension point, preserving its existing content. A reload guard must check the same option scope the theme changes: global or per-session. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
 
 ### CCB integration
@@ -204,7 +217,7 @@ Do not edit CCB's installed theme scripts: its installer replaces them. If an ol
 
 ### OpenCode Go
 
-OpenCode Go usage is opt-in and, for now, standalone-tmux only: the WezTerm plugin does not display it yet. Select it with `--providers`, which takes a comma-separated list drawn from `claude`, `codex`, and `opencode-go`:
+OpenCode Go usage is opt-in in both integrations: the tmux helper shows it only with `--providers`, and the WezTerm plugin only with `opencode_go.enabled = true` on a Unix host. In tmux, select it with `--providers`, which takes a comma-separated list drawn from `claude`, `codex`, and `opencode-go`:
 
 ```sh
 python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers opencode-go
@@ -247,9 +260,16 @@ quota.apply_to_config(config, {
   position = "left",
   dashboard_key = { key = "u", mods = "CTRL|SHIFT" },
   compact = false,
+  layout = nil,          -- nil (legacy full line), "full", "compact" or "minimal"
+  hide_inactive = false, -- omit providers whose CLI is not running
+  opencode_go = {
+    enabled = false,     -- opt-in; Unix only
+    key_command = nil,   -- optional command that prints the Go key
+  },
   icons = {
     claude = "⚡",
     codex  = "✦",
+    opencode_go = "◈",
     week   = "▪",
   },
   bars = {
@@ -268,13 +288,39 @@ Options:
 - `position`: `"left"` or `"right"`. Default: `"right"`
 - `dashboard_key`: opens the Claude usage dashboard. Default: `CTRL+SHIFT+U`
 - `compact`: hide reset countdowns to shrink the status-bar footprint. Default: `false`
+- `layout`: `nil` keeps the legacy full line; `"full"` is the same rendering with OpenCode Go included when enabled; `"compact"` and `"minimal"` follow the tmux dense layouts. Default: `nil`
+- `hide_inactive`: omit providers whose CLI is not running; when every provider is hidden the status is empty. Default: `false`
+- `opencode_go.enabled`: show OpenCode Go from the tmux helper. Default: `false`
+- `opencode_go.key_command`: optional command whose first output line is the Go key, forwarded to the helper. Default: `nil`
 - `icons.claude`: Claude prefix icon. Default: `⚡` (override to taste, e.g. `▲`)
 - `icons.codex`: Codex prefix icon. Default: `✦` (override to taste, e.g. `◆`)
-- `icons.week`: separator between Codex usage windows
+- `icons.opencode_go`: OpenCode Go prefix icon. Default: `◈`
+- `icons.week`: separator between usage windows
 - `bars.enabled`: show compact percentage bars
 - `bars.width`: number of bar cells
 - `bars.full` / `bars.empty`: glyphs used for the bar
 - `codex_script`: absolute path to `codex-limits.py`, overriding auto-discovery. Default: `nil` (auto-detect)
+
+### Layouts, inactive providers and OpenCode Go
+
+```lua
+quota.apply_to_config(config, {
+  layout = "compact",
+  hide_inactive = true,
+  opencode_go = {
+    enabled = true,
+    -- key_command = "your-secret-tool get opencode-go",
+  },
+})
+```
+
+`layout = "compact"` and `layout = "minimal"` mirror the tmux dense layouts: an `icon Name:` head, a one-cell gauge and countdown for short windows such as `5h`, percentage only for long windows with the countdown kept when a window is at `80%` or more or rate limited, and the highest percentage plus a red `!` in the minimal layout. `~` after the colon marks stale data, an inactive CLI keeps only its dim name, and the other states read `…`, `?`, `no key`, `no plan` or `ready`. Windows are joined with ` · ` and providers with a dim `│`. `layout = nil` and `layout = "full"` keep the bar-and-countdown rendering above; `compact = true` still means "hide the countdowns" in those layouts. There is no `auto` layout in WezTerm.
+
+`hide_inactive = true` drops providers whose CLI is not running, so a closed Claude or Codex session disappears instead of showing `not running`; separators stay clean and the line is empty when nothing is active. OpenCode Go counts as inactive when the helper reports `not_running`.
+
+`opencode_go.enabled = true` adds the Go provider to the WezTerm status bar. The plugin shells out to this repo's `tmux-quota.py --json --providers opencode-go` at most once every 15 seconds and reuses the tmux cache, so tmux and WezTerm report the same numbers without separate network traffic. Expired windows stop counting between helper runs. Find the helper with `WEZTERM_AGENT_QUOTA_TMUX_HELPER=/absolute/path/to/tmux-quota.py` if auto-discovery misses it. A malformed or failed helper run shows `?` for Go and leaves Claude and Codex untouched.
+
+This bridge is Unix-only: the helper and its bridge are a Python process pair, so on native Windows `opencode_go.enabled = true` renders `not supported on Windows` and never starts a process. The key comes from the same precedence documented for tmux: a non-blank `OPENCODE_API_KEY` in the WezTerm environment, then `opencode_go.key_command`, then the OpenCode **API-key login** saved in OpenCode's `auth.json`. The Claude and Codex credential paths are untouched.
 
 ### Compact mode
 
@@ -350,6 +396,7 @@ Status display:
 - shows actual usage only when the corresponding tool is running
 - colors usage as green under `50%`, yellow from `50%` to `79%`, and red at `80%` and above
 - renders compact 8-cell bars by default
+- OpenCode Go (when enabled on a Unix host) comes from `tmux-quota.py --json`, so it shares the tmux cache and key resolution instead of adding a second credential path
 
 tmux:
 
@@ -383,6 +430,8 @@ tmux:
 - Codex helper fails in a GUI `PATH` environment: run `python3 codex-limits.py` directly; the helper also checks common `nvm` locations.
 - Codex helper path resolution fails in a custom environment: set `WEZTERM_AGENT_QUOTA_CODEX_HELPER=/absolute/path/to/codex-limits.py` before launching WezTerm.
 - Cached WezTerm data looks stale: inspect `/tmp/wezterm-quota-limit-"$USER"-*.json` and reload WezTerm; this cache is separate from tmux's cache.
+- OpenCode Go shows `?`: run `python3 tmux-quota.py --json --providers opencode-go` to see the helper's own state; `no key` means no environment key, key command or saved OpenCode API-key login was usable.
+- OpenCode Go shows `not supported on Windows`: the Go bridge is Unix-only; the provider's other states still work on Windows.
 - Codex helper is missing: ensure the full plugin repo was installed, not just `plugin/init.lua` by itself.
 
 ### tmux

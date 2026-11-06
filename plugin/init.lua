@@ -10,9 +10,13 @@ local config = {
   poll_interval_secs = 60,
   position = "right", -- "left" or "right"
   dashboard_key = { key = "u", mods = "CTRL|SHIFT" }, -- keybind to open dashboard
+  layout = nil,       -- nil keeps the legacy full line; "full" | "compact" | "minimal"
+  hide_inactive = false, -- omit providers whose CLI is not running
+  opencode_go = { enabled = false, key_command = nil },
   icons = {
     claude = "⚡", -- override to taste, e.g. "▲"
     codex  = "✦", -- override to taste, e.g. "◆"
+    opencode_go = "◈",
     week   = "▪",
     bolt   = "⚡", -- legacy alias
   },
@@ -76,6 +80,8 @@ end
 
 local DIM = hex_to_fg("#565f89")
 local BRIGHT = hex_to_fg("#c0caf5")
+local STALE = hex_to_fg("#e0af68")
+local RED = hex_to_fg("#f7768e")
 
 -- Deep merge: t2 values override t1, recurses into nested tables
 local function deep_merge(t1, t2)
@@ -719,6 +725,65 @@ local function get_codex_script()
   return CODEX_SCRIPT
 end
 
+-- Same candidate logic as codex-limits.py, for the tmux-oracle helper the Go bridge
+-- shells out to. WEZTERM_AGENT_QUOTA_TMUX_HELPER overrides every candidate.
+local function resolve_tmux_helper()
+  local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+  local plugin_dir = dirname(current_file_path())
+  local candidates = {}
+
+  local env_path = os.getenv("WEZTERM_AGENT_QUOTA_TMUX_HELPER")
+  if env_path and env_path ~= "" then
+    candidates[#candidates + 1] = env_path
+  end
+
+  -- The tmux helper ships beside codex-limits.py, so prefer its resolved directory.
+  local codex_dir = dirname(config.codex_script or get_codex_script())
+  if codex_dir then
+    candidates[#candidates + 1] = codex_dir .. "/tmux-quota.py"
+    candidates[#candidates + 1] = codex_dir .. "\\tmux-quota.py"
+  end
+
+  if plugin_dir then
+    local repo_root = dirname(plugin_dir)
+    if repo_root then
+      candidates[#candidates + 1] = repo_root .. "/tmux-quota.py"
+      candidates[#candidates + 1] = repo_root .. "\\tmux-quota.py"
+    end
+    candidates[#candidates + 1] = plugin_dir .. "/tmux-quota.py"
+    candidates[#candidates + 1] = plugin_dir .. "\\tmux-quota.py"
+  end
+
+  if home ~= "" then
+    if is_windows then
+      local appdata = os.getenv("LOCALAPPDATA") or (home .. "\\AppData\\Local")
+      candidates[#candidates + 1] = appdata .. "\\wezterm\\tmux-quota.py"
+      candidates[#candidates + 1] = home .. "\\dev\\Plugins\\agent-quota.wezterm\\tmux-quota.py"
+    else
+      candidates[#candidates + 1] = home .. "/dev/Plugins/wezterm-quota-limit/tmux-quota.py"
+      candidates[#candidates + 1] = home .. "/dev/Plugins/agent-quota.wezterm/tmux-quota.py"
+      candidates[#candidates + 1] = home .. "/.local/share/wezterm/tmux-quota.py"
+    end
+  end
+
+  for _, candidate in ipairs(candidates) do
+    if file_exists(candidate) then
+      return candidate
+    end
+  end
+
+  return candidates[1] or "tmux-quota.py"
+end
+
+-- Resolved lazily on first Go fetch (the plugin dir is not known at load time)
+local TMUX_HELPER = nil
+local function get_tmux_helper()
+  if not TMUX_HELPER then
+    TMUX_HELPER = resolve_tmux_helper()
+  end
+  return TMUX_HELPER
+end
+
 -- Format a Unix timestamp as time-until string
 local function time_until_unix(ts)
   if not ts then return "?" end
@@ -1200,12 +1265,373 @@ local function fetch_usage()
   return entry.data
 end
 
+-- ============================================================
+-- OPENCODE GO (tmux oracle bridge)
+-- ============================================================
+local GO_GATE_SECS = 15          -- min seconds between Go helper runs
+local GO_UNSUPPORTED = "unsupported"
+
+local go_last_report = nil
+local go_last_run_at = 0
+
+local function opencode_go_enabled()
+  return type(config.opencode_go) == "table" and config.opencode_go.enabled == true
+end
+
+local function go_argv()
+  local argv = { "python3", get_tmux_helper(), "--json", "--providers", "opencode-go" }
+  local key_command = type(config.opencode_go) == "table" and config.opencode_go.key_command or nil
+  if type(key_command) == "string" and key_command ~= "" then
+    argv[#argv + 1] = "--opencode-key-command"
+    argv[#argv + 1] = key_command
+  end
+  return argv
+end
+
+-- Only the documented shape is accepted; anything else is a failed bridge run.
+local function parse_go_report(raw)
+  if type(raw) ~= "string" or raw == "" then
+    return nil
+  end
+
+  local ok, payload = pcall(wezterm.json_parse, raw)
+  if not ok or type(payload) ~= "table" or type(payload.providers) ~= "table" then
+    return nil
+  end
+
+  for _, entry in ipairs(payload.providers) do
+    if type(entry) == "table" and entry.name == "opencode-go" then
+      if type(entry.state) ~= "string" then
+        return nil
+      end
+
+      local windows = {}
+      if type(entry.windows) == "table" then
+        for _, window in ipairs(entry.windows) do
+          local percent = type(window) == "table" and tonumber(window.percent) or nil
+          if percent and percent == percent and percent ~= math.huge and percent ~= -math.huge then
+            local reset_at = tonumber(window.reset_at)
+            windows[#windows + 1] = {
+              label = type(window.label) == "string" and window.label or "usage",
+              percent = percent,
+              reset_at = reset_at,
+              limited = window.limited == true,
+            }
+          end
+        end
+      end
+
+      return { state = entry.state, stale = entry.stale == true, windows = windows }
+    end
+  end
+
+  return nil
+end
+
+local function fetch_opencode_go()
+  if not opencode_go_enabled() then
+    return nil
+  end
+
+  -- The helper is POSIX-only; report it instead of spawning anything on Windows.
+  if is_windows then
+    return { state = GO_UNSUPPORTED, stale = false, windows = {} }
+  end
+
+  local now = os.time()
+  if not go_last_report or (now - go_last_run_at) >= GO_GATE_SECS then
+    go_last_run_at = now
+    local ok, stdout, stderr = wezterm.run_child_process(go_argv())
+    local report = nil
+    if ok and type(stdout) == "string" then
+      report = parse_go_report(stdout)
+    end
+    if not report then
+      wezterm.log_error("agent-quota: opencode go helper failed: " .. tostring(stderr or stdout))
+      report = { state = "unavailable", stale = false, windows = {} }
+    end
+    go_last_report = report
+  end
+
+  -- Between bridge runs, windows whose reset already passed must stop counting.
+  local windows = {}
+  for _, window in ipairs(go_last_report.windows) do
+    if window.reset_at == nil or now < window.reset_at then
+      windows[#windows + 1] = window
+    end
+  end
+
+  local state = go_last_report.state
+  if state == "ok" and #windows == 0 then
+    state = "syncing"
+  end
+
+  return { state = state, stale = go_last_report.stale, windows = windows }
+end
+
+-- ============================================================
+-- PROVIDER REPORTS (one normalised shape for the dense layouts)
+-- ============================================================
+local function claude_report(data)
+  if type(data) ~= "table" then
+    return { state = "unavailable", windows = {} }
+  end
+  if data.not_running then
+    return { state = "not_running", windows = {} }
+  end
+  if is_rate_limited_error(data.error) then
+    return { state = "rate_limited", windows = {} }
+  end
+  if data.syncing then
+    return { state = "syncing", windows = {} }
+  end
+  if data.error then
+    return { state = "error", windows = {} }
+  end
+
+  local five = type(data.five_hour) == "table" and data.five_hour or {}
+  local seven = type(data.seven_day) == "table" and data.seven_day or {}
+  return {
+    state = "ok",
+    windows = {
+      {
+        label = "5h",
+        percent = tonumber(five.utilization) or 0,
+        reset_at = unix_from_iso_utc(five.resets_at),
+        limited = false,
+      },
+      {
+        label = "7d",
+        percent = tonumber(seven.utilization) or 0,
+        reset_at = unix_from_iso_utc(seven.resets_at),
+        limited = false,
+      },
+    },
+  }
+end
+
+local function codex_report(cd, active)
+  if type(cd) ~= "table" then
+    return { state = "unavailable", windows = {} }
+  end
+  if not active then
+    return { state = "not_running", windows = {} }
+  end
+  if cd.error == "not running" then
+    return { state = "syncing", windows = {} }
+  end
+  if cd.syncing then
+    return { state = "syncing", windows = {} }
+  end
+  if cd.ready then
+    return { state = "ready", windows = {} }
+  end
+  if cd.error then
+    return { state = "error", windows = {} }
+  end
+
+  local windows = {}
+  if type(cd.primary_pct) == "number" then
+    windows[#windows + 1] = {
+      label = codex_window_label(cd.primary_mins),
+      percent = cd.primary_pct,
+      reset_at = tonumber(cd.primary_reset_at),
+      limited = false,
+    }
+  end
+  if type(cd.secondary_pct) == "number" then
+    windows[#windows + 1] = {
+      label = codex_window_label(cd.secondary_mins),
+      percent = cd.secondary_pct,
+      reset_at = tonumber(cd.secondary_reset_at),
+      limited = false,
+    }
+  end
+  if #windows == 0 then
+    return { state = "syncing", windows = {} }
+  end
+  return { state = "ok", windows = windows }
+end
+
+-- ============================================================
+-- DENSE LAYOUTS (same rules as the tmux --layout compact/minimal)
+-- ============================================================
+local GAUGE_GLYPHS = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" }
+
+local function gauge_cell(percent)
+  local level = math.ceil((tonumber(percent) or 0) / 12.5)
+  if level < 1 then
+    level = 1
+  elseif level > #GAUGE_GLYPHS then
+    level = #GAUGE_GLYPHS
+  end
+  return GAUGE_GLYPHS[level]
+end
+
+local function status_label(value)
+  local text = tostring(value or "usage"):gsub("[^A-Za-z0-9 _.-]", "")
+  if text == "" then
+    return "usage"
+  end
+  return text:sub(1, 48)
+end
+
+local function is_short_window(label)
+  local first = label:match("^(%S+)")
+  return first ~= nil and first:match("^%d+[mh]$") ~= nil
+end
+
+local function countdown_unix(reset_at, now)
+  if type(reset_at) ~= "number" then
+    return nil
+  end
+
+  local diff = math.max(0, math.floor(reset_at - now))
+  local days = math.floor(diff / 86400)
+  local hours = math.floor((diff % 86400) / 3600)
+  local minutes = math.floor((diff % 3600) / 60)
+  if days > 0 then
+    return string.format("%dd%dh", days, hours)
+  elseif hours > 0 then
+    return string.format("%dh%02dm", hours, minutes)
+  end
+  return string.format("%dm", minutes)
+end
+
+local function dense_window(window, now)
+  local label = status_label(window.label)
+  local percent = tonumber(window.percent) or 0
+  local short = is_short_window(label)
+  local color = usage_color_esc(percent)
+  local pct_color = window.limited and RED or color
+
+  local parts = { BRIGHT .. label .. RESET }
+  if short then
+    local gauge_color = percent <= 0 and DIM or color
+    parts[#parts + 1] = gauge_color .. gauge_cell(percent) .. RESET
+  end
+  local marker = window.limited and "!" or ""
+  parts[#parts + 1] = pct_color .. string.format("%.0f%%", percent) .. marker .. RESET
+
+  local remaining = countdown_unix(window.reset_at, now)
+  if remaining and (short or window.limited or percent >= 80) then
+    parts[#parts + 1] = DIM .. remaining .. RESET
+  end
+  return table.concat(parts, " ")
+end
+
+local function dense_state_text(state)
+  if state == "unsupported" then
+    return "unsupported"
+  elseif state == "no_key" then
+    return "no key"
+  elseif state == "no_plan" then
+    return "no plan"
+  elseif state == "ready" then
+    return "ready"
+  elseif state == "syncing" or state == "rate_limited" then
+    return "…"
+  end
+  return "?"
+end
+
+local function dense_provider(icon, name, report, layout, now)
+  if report.state == "not_running" then
+    return DIM .. icon .. " " .. name .. ":"
+  end
+
+  local head = BRIGHT .. icon .. " " .. name .. ":"
+  if report.stale then
+    head = head .. STALE .. "~" .. RESET
+  end
+
+  local windows = report.windows
+  if #windows == 0 then
+    return head .. " " .. BRIGHT .. dense_state_text(report.state) .. RESET
+  end
+
+  if layout == "minimal" then
+    local highest = 0
+    local limited = false
+    for _, window in ipairs(windows) do
+      local percent = tonumber(window.percent) or 0
+      if percent > highest then
+        highest = percent
+      end
+      if window.limited then
+        limited = true
+      end
+    end
+    local color = limited and RED or usage_color_esc(highest)
+    local bang = limited and "!" or ""
+    return head .. " " .. color .. string.format("%.0f%%", highest) .. bang .. RESET
+  end
+
+  local rendered = {}
+  for _, window in ipairs(windows) do
+    rendered[#rendered + 1] = dense_window(window, now)
+  end
+  return head .. " " .. table.concat(rendered, DIM .. " · ")
+end
+
+-- OpenCode Go in the legacy full style: bars, parenthesised countdowns.
+local function full_go_str(report, now)
+  local gi = " " .. (config.icons.opencode_go or "◈") .. " "
+  local head = DIM .. gi .. BRIGHT .. "OpenCode Go: "
+  local windows = report and report.windows or {}
+
+  if #windows == 0 then
+    local state = report and report.state or "unavailable"
+    local text
+    if state == "not_running" then
+      text = "not running"
+    elseif state == "unsupported" then
+      text = "not supported on Windows"
+    elseif state == "no_key" then
+      text = "no key"
+    elseif state == "no_plan" then
+      text = "no Go plan"
+    elseif state == "ready" then
+      text = "ready"
+    elseif state == "syncing" or state == "rate_limited" then
+      text = "syncing..."
+    else
+      text = "unavailable"
+    end
+    return head .. DIM .. text
+  end
+
+  if report.stale then
+    head = head .. STALE .. "stale "
+  end
+  local parts = {}
+  for _, window in ipairs(windows) do
+    local label = status_label(window.label)
+    local percent = tonumber(window.percent) or 0
+    local segment = BRIGHT .. label .. " "
+    local bar = usage_bar_esc(percent)
+    if bar then
+      segment = segment .. bar .. DIM .. " "
+    end
+    segment = segment .. usage_color_esc(percent) .. string.format("%.0f%%", percent)
+    if window.limited then
+      segment = segment .. RED .. " limited"
+    end
+    local remaining = countdown_unix(window.reset_at, now)
+    if remaining then
+      segment = segment .. DIM .. " (" .. remaining .. ")"
+    end
+    parts[#parts + 1] = segment
+  end
+  local separator = DIM .. "  " .. (config.icons.week or "▪") .. " "
+  return head .. table.concat(parts, separator)
+end
+
 -- Dashboard URL
 local DASHBOARD_URL = "https://console.anthropic.com/settings/usage"
 
 -- Build status string using raw ANSI escapes (avoids wezterm.format deserialization issues)
-local function build_status_string(data, window, pane)
-  -- ── Claude ──────────────────────────────────────────────
+local function claude_full_str(data)
   local claude_str
   local ci = " " .. (config.icons.claude or config.icons.bolt or "⚡") .. " "
   if data.not_running then
@@ -1247,11 +1673,11 @@ local function build_status_string(data, window, pane)
       claude_str = claude_str .. DIM .. " (" .. time_until(seven_reset) .. ")"
     end
   end
+  return claude_str
+end
 
-  -- ── Codex ───────────────────────────────────────────────
+local function codex_full_str(cd, codex_active)
   local codex_str
-  local cd, codex_active = fetch_codex_limits()
-
   local coi = " " .. (config.icons.codex or "✦") .. " "
   if not codex_active then
     codex_str = DIM .. coi .. BRIGHT .. "Codex: " .. DIM .. "not running"
@@ -1299,17 +1725,70 @@ local function build_status_string(data, window, pane)
   else
     codex_str = DIM .. coi .. BRIGHT .. "Codex: " .. DIM .. "loading..."
   end
+  return codex_str
+end
 
-  -- ── Join with separator ──────────────────────────────────
-  return claude_str
-    .. DIM .. "  |" .. codex_str
-    .. " " .. RESET
+local function build_status_string(data, window, pane)
+  local layout = config.layout
+  local use_dense = layout == "compact" or layout == "minimal"
+  local now = os.time()
+
+  local cd, codex_active = fetch_codex_limits()
+  local go_report = opencode_go_enabled() and fetch_opencode_go() or nil
+
+  local claude_active = not (type(data) == "table" and data.not_running)
+
+  local segments = {}
+  local function push(active, dense_text, full_text)
+    if config.hide_inactive and not active then
+      return
+    end
+    segments[#segments + 1] = use_dense and dense_text or full_text
+  end
+
+  push(
+    claude_active,
+    dense_provider(
+      config.icons.claude or config.icons.bolt or "⚡", "Claude",
+      claude_report(data), layout, now
+    ),
+    claude_full_str(data)
+  )
+
+  push(
+    codex_active,
+    dense_provider(config.icons.codex or "✦", "Codex", codex_report(cd, codex_active), layout, now),
+    codex_full_str(cd, codex_active)
+  )
+
+  if go_report then
+    push(
+      go_report.state ~= "not_running",
+      dense_provider(config.icons.opencode_go or "◈", "OpenCode Go", go_report, layout, now),
+      full_go_str(go_report, now)
+    )
+  end
+
+  if #segments == 0 then
+    return ""
+  end
+
+  if use_dense then
+    local joiner = "  " .. DIM .. "│" .. RESET .. "  "
+    return " " .. table.concat(segments, joiner) .. " " .. RESET
+  end
+
+  -- Legacy full line: the same separator and trailing reset as before.
+  return table.concat(segments, DIM .. "  |") .. " " .. RESET
 end
 
 function M.apply_to_config(c, opts)
   if opts then
     config = deep_merge(config, opts)
     CODEX_SCRIPT = nil -- reset so get_codex_script() re-resolves with new config
+    TMUX_HELPER = nil  -- and so the Go bridge re-resolves its helper
+    go_last_report = nil
+    go_last_run_at = 0
   end
 
   -- Add keybinding to open usage dashboard
@@ -1349,6 +1828,21 @@ function M.apply_to_config(c, opts)
       wezterm.log_error("claude-usage: " .. tostring(err))
     end
   end)
+end
+
+-- Test-only hook; inert unless the harness sets the global before loading this file.
+if rawget(_G, "WEZTERM_QUOTA_TEST") then
+  M._test = {
+    build_status_string = build_status_string,
+    fetch_opencode_go = fetch_opencode_go,
+    parse_go_report = parse_go_report,
+    go_argv = go_argv,
+    dense_provider = dense_provider,
+    reset_go = function()
+      go_last_report = nil
+      go_last_run_at = 0
+    end,
+  }
 end
 
 return M

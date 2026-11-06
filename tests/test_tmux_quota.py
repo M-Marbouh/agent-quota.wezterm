@@ -1887,6 +1887,209 @@ class OpenCodeSavedLoginTests(unittest.TestCase):
                 )
 
 
+class JsonOutputTests(unittest.TestCase):
+    """--json: one machine-readable object, same fetches, always valid JSON."""
+
+    PROVIDERS = ("claude", "codex", "opencode-go")
+    CLAUDE = {"status": "ok", "windows": [{"label": "5h", "percent": 3, "reset_at": 1793986200}]}
+    CODEX = {"status": "ok", "windows": [{"label": "5h", "percent": 7, "reset_at": 1793987009}]}
+
+    @staticmethod
+    def _response(body):
+        return OpenCodeGoTests._response(body)
+
+    def test_provider_shape_and_window_normalisation(self):
+        for state in quota.JSON_STATES:
+            with self.subTest(state=state):
+                entry = quota.json_provider("opencode-go", {
+                    "status": state,
+                    "windows": [{
+                        "label": "5h;drop", "percent": 42.5,
+                        "reset_at": 1793986584.0, "limited": True, "secret": "ignored",
+                    }],
+                })
+                self.assertEqual(list(entry), ["name", "state", "stale", "windows"])
+                self.assertEqual(entry["name"], "opencode-go")
+                self.assertEqual(entry["state"], state)
+                self.assertIs(entry["stale"], False)
+                self.assertEqual(entry["windows"], [{
+                    "label": "5hdrop", "percent": 42.5,
+                    "reset_at": 1793986584.0, "limited": True,
+                }])
+                self.assertEqual(list(entry["windows"][0]),
+                                 ["label", "percent", "reset_at", "limited"])
+                self.assertNotIn("secret", json.dumps(entry))
+                json.dumps(entry, allow_nan=False)
+
+        for status in (None, "", "OK", "weird", 1, ["ok"]):
+            with self.subTest(unknown_state=repr(status)):
+                self.assertEqual(quota.json_provider("claude", {"status": status})["state"],
+                                 "unavailable")
+
+    def test_windows_reject_non_numeric_percent_and_non_finite_resets(self):
+        entry = quota.json_provider("opencode-go", {"status": "ok", "windows": [
+            {"label": "5h", "percent": 5},
+            {"label": "7d", "percent": 7, "reset_at": float("inf")},
+            {"label": "mo", "percent": 1, "reset_at": 1796503387, "limited": False},
+            {"label": "percent str", "percent": "9"},
+            {"label": "percent bool", "percent": True},
+            {"label": "percent missing"},
+            "not a window",
+            None,
+        ]})
+        self.assertEqual(entry["windows"], [
+            {"label": "5h", "percent": 5.0, "reset_at": None, "limited": False},
+            {"label": "7d", "percent": 7.0, "reset_at": None, "limited": False},
+            {"label": "mo", "percent": 1.0, "reset_at": 1796503387.0, "limited": False},
+        ])
+        self.assertEqual(quota.json_windows({"windows": "nope"}), [])
+        self.assertEqual(quota.json_windows({}), [])
+        self.assertEqual(
+            quota.json_provider("codex", {"status": "ok"})["windows"], []
+        )
+
+    def test_stale_is_read_from_both_fields(self):
+        for data, expected in (
+            ({"status": "ok", "stale": True}, True),
+            ({"status": "ok", "display_state": "stale"}, True),
+            ({"status": "ok", "stale": None, "display_state": "fresh"}, False),
+            ({"status": "ok", "stale": "yes"}, False),
+            ({"status": "ok"}, False),
+        ):
+            with self.subTest(data=data):
+                self.assertIs(quota.json_provider("claude", data)["stale"], expected)
+
+    def test_report_carries_every_state_with_provider_order(self):
+        data = {name: {"status": state, "windows": []}
+                for name, state in zip(self.PROVIDERS, quota.JSON_STATES)}
+        with mock.patch.object(
+            quota, "collect_status", return_value=(self.PROVIDERS, {}, data)
+        ):
+            report = quota.json_report(self.PROVIDERS, None)
+        self.assertEqual(report["version"], 1)
+        self.assertEqual([entry["name"] for entry in report["providers"]], list(self.PROVIDERS))
+        self.assertEqual([entry["state"] for entry in report["providers"]],
+                         list(quota.JSON_STATES[:3]))
+
+        with mock.patch.object(
+            quota, "collect_status", return_value=(("claude", "codex"), {}, {})
+        ) as collect:
+            report = quota.json_report(("codex", "claude"), None)
+        self.assertEqual(collect.call_args[0][0], ("codex", "claude"))
+        self.assertEqual([entry["name"] for entry in report["providers"]], ["claude", "codex"])
+        self.assertEqual([entry["state"] for entry in report["providers"]],
+                         ["unavailable", "unavailable"])
+
+    def test_report_uses_the_same_fetches_cache_and_key_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(quota, "cache_dir", return_value=root), \
+                 mock.patch.object(
+                     quota, "process_states", return_value={
+                         "claude": True, "codex": True, "opencode-go": True,
+                     }) as states, \
+                 mock.patch.object(quota, "fetch_claude", return_value=self.CLAUDE) as claude, \
+                 mock.patch.object(quota, "fetch_codex", return_value=self.CODEX) as codex, \
+                 mock.patch.object(
+                     quota.urllib.request, "urlopen",
+                     return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                 ) as urlopen, \
+                 mock.patch.object(quota.time, "time", return_value=100), \
+                 mock.patch.dict(os.environ, {"OPENCODE_API_KEY": GO_KEY}):
+                report = quota.json_report(self.PROVIDERS, None)
+            files = {path.name for path in root.iterdir()}
+        text = json.dumps(report)
+        self.assertEqual([entry["state"] for entry in report["providers"]], ["ok"] * 3)
+        self.assertEqual([entry["name"] for entry in report["providers"]], list(self.PROVIDERS))
+        self.assertEqual(states.call_count, 1)
+        self.assertEqual(states.call_args[0][0], self.PROVIDERS)
+        claude.assert_called_once()
+        codex.assert_called_once()
+        urlopen.assert_called_once()
+        self.assertEqual(urlopen.call_args[0][0].get_header("Authorization"), f"Bearer {GO_KEY}")
+        self.assertEqual(files, {
+            "claude.json", "claude.lock", "codex.json", "codex.lock",
+            "opencode-go.json", "opencode-go.lock",
+        })
+        for haystack in (text, json.dumps(report["providers"], indent=2)):
+            self.assertNotIn(GO_KEY, haystack)
+            self.assertNotIn("#[", haystack)
+            self.assertNotIn("Bearer", haystack)
+        self.assertEqual(report["providers"][2]["windows"][0]["label"], "5h")
+        self.assertEqual(len(report["providers"][2]["windows"]), 3)
+
+    def test_report_survives_a_failing_fetch_as_a_valid_state(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(quota, "cache_dir", return_value=Path(directory)), \
+             mock.patch.object(quota, "process_states", return_value={"claude": True}), \
+             mock.patch.object(quota, "fetch_claude", side_effect=RuntimeError("boom")), \
+             mock.patch.object(quota.time, "time", return_value=1):
+            report = quota.json_report(("claude",), None)
+        self.assertEqual(report["providers"][0]["state"], "error")
+        self.assertNotIn("boom", json.dumps(report))
+        json.dumps(report, allow_nan=False)
+
+    def test_cli_prints_the_documented_shape_when_the_run_raises(self):
+        for failure in ("json_report", "collect_status"):
+            with self.subTest(failure=failure):
+                output = io.StringIO()
+                with mock.patch.object(quota, failure, side_effect=RuntimeError("boom")), \
+                     mock.patch.object(
+                         sys, "argv",
+                         [str(SOURCE), "--json", "--providers", "opencode-go,claude"],
+                     ), contextlib.redirect_stdout(output):
+                    self.assertEqual(quota.main(), 0)
+                report = json.loads(output.getvalue())
+                self.assertEqual(report["version"], 1)
+                self.assertEqual([entry["name"] for entry in report["providers"]],
+                                 ["claude", "opencode-go"])
+                self.assertEqual([entry["state"] for entry in report["providers"]],
+                                 ["error", "error"])
+                self.assertEqual([entry["stale"] for entry in report["providers"]],
+                                 [False, False])
+                self.assertEqual([entry["windows"] for entry in report["providers"]], [[], []])
+                self.assertNotIn("boom", output.getvalue())
+                self.assertNotIn("Quota unavailable", output.getvalue())
+
+    def test_json_ignores_layout_and_hide_inactive(self):
+        output = io.StringIO()
+        with mock.patch.object(quota, "run_status", side_effect=AssertionError("rendered")), \
+             mock.patch.object(
+                 quota, "json_report", return_value={"version": 1, "providers": []}
+             ) as report, \
+             mock.patch.object(
+                 sys, "argv",
+                 [str(SOURCE), "--json", "--layout", "minimal", "--hide-inactive",
+                  "--max-width", "10"],
+             ), contextlib.redirect_stdout(output):
+            self.assertEqual(quota.main(), 0)
+        report.assert_called_once()
+        self.assertEqual(report.call_args[0][0], quota.DEFAULT_PROVIDERS)
+        self.assertIsNone(report.call_args[0][1])
+        self.assertEqual(json.loads(output.getvalue()), {"version": 1, "providers": []})
+
+    def test_json_flag_is_not_part_of_the_tmux_command(self):
+        line = quota.tmux_command(SOURCE, True, ("claude", "opencode-go"), "compact", 80,
+                                  "tool get key", True)
+        self.assertNotIn("--json", line)
+        self.assertNotIn("--json", quota.tmux_command(SOURCE))
+
+    def test_default_rendering_is_untouched_by_the_json_flag(self):
+        states = {"claude": True, "codex": True, "opencode-go": True}
+        go = {"status": "ok", "windows": [{"label": "5h", "percent": 0, "reset_at": 5000}]}
+        rendered = quota.render_status(
+            states, self.CLAUDE, self.CODEX, now=100, use_unicode=True,
+            providers=self.PROVIDERS, opencode_go=go,
+        )
+        self.assertIn("OpenCode Go:", rendered)
+        self.assertNotIn("{", rendered)
+        with mock.patch.object(quota, "collect_status",
+                               return_value=(self.PROVIDERS, states, {})) as collect:
+            text = quota.run_status(False, self.PROVIDERS, "full", None, None, False)
+        self.assertEqual(collect.call_args[0][0], self.PROVIDERS)
+        self.assertTrue(text.startswith("#["))
+
+
 class HideInactiveTests(unittest.TestCase):
     """--hide-inactive drops providers whose CLI process is not running."""
 
@@ -1979,8 +2182,8 @@ class HideInactiveTests(unittest.TestCase):
     # A fixed commit, not HEAD: after this change is committed, HEAD would compare the
     # implementation against itself and the test would stop catching regressions. This is the
     # last commit before --hide-inactive, so it still exposes the layout-aware render_status
-    # this test drives; 3eb7215 predates --layout/--max-width and cannot be called with them.
-    BASELINE_COMMIT = "507e516"
+    # this test drives; a994170 predates --layout/--max-width and cannot be called with them.
+    BASELINE_COMMIT = "88489f9"
 
     def test_omitting_the_flag_matches_baseline_bytes(self):
         baseline = subprocess.run(

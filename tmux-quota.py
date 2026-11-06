@@ -875,15 +875,10 @@ def render_status(
     return render_layout(layout, states, data, selected, current, use_unicode)
 
 
-def run_status(
-    use_unicode: bool = False,
-    providers: tuple[str, ...] = DEFAULT_PROVIDERS,
-    layout: str = "full",
-    max_width: int | None = None,
-    key_command: str | None = None,
-    hide_inactive: bool = False,
-) -> str:
-    now = time.time()
+def collect_status(
+    providers: tuple[str, ...], key_command: str | None, now: float
+) -> tuple[tuple[str, ...], dict[str, bool], dict[str, dict[str, Any]]]:
+    """Fetch every selected provider once: canonical order, process states, raw entries."""
     selected = tuple(name for name in PROVIDERS if name in providers)
     states = process_states(selected)
     root = cache_dir()
@@ -904,6 +899,19 @@ def run_status(
                 else (lambda: fetch_opencode_go(now))
             )
             data[name] = provider_data("opencode-go", active, now, fetcher, root)
+    return selected, states, data
+
+
+def run_status(
+    use_unicode: bool = False,
+    providers: tuple[str, ...] = DEFAULT_PROVIDERS,
+    layout: str = "full",
+    max_width: int | None = None,
+    key_command: str | None = None,
+    hide_inactive: bool = False,
+) -> str:
+    now = time.time()
+    selected, states, data = collect_status(providers, key_command, now)
     return render_status(
         states,
         data.get("claude", {}),
@@ -916,6 +924,72 @@ def run_status(
         max_width,
         hide_inactive,
     )
+
+
+JSON_STATES = (
+    "ok", "not_running", "syncing", "no_plan", "no_key", "rate_limited", "unavailable", "error",
+)
+
+
+def json_number(value: Any) -> float | None:
+    """A finite JSON number for a real numeric value, rejecting booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def json_windows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """The windows a layout would draw, as plain JSON numbers."""
+    windows = data.get("windows") if isinstance(data.get("windows"), list) else []
+    report = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        percent = json_number(window.get("percent"))
+        if percent is None:
+            continue
+        report.append({
+            "label": tmux_text(window.get("label", "usage")) or "usage",
+            "percent": percent,
+            "reset_at": json_number(window.get("reset_at")),
+            "limited": window.get("limited") is True,
+        })
+    return report
+
+
+def json_provider(name: str, data: dict[str, Any]) -> dict[str, Any]:
+    status = data.get("status")
+    return {
+        "name": name,
+        "state": status if status in JSON_STATES else "unavailable",
+        "stale": data.get("stale") is True or data.get("display_state") == "stale",
+        "windows": json_windows(data),
+    }
+
+
+def error_report(selected: tuple[str, ...]) -> dict[str, Any]:
+    """The documented shape for a run that could not produce any data."""
+    return {
+        "version": 1,
+        "providers": [
+            {"name": name, "state": "error", "stale": False, "windows": []}
+            for name in selected
+        ],
+    }
+
+
+def json_report(providers: tuple[str, ...], key_command: str | None) -> dict[str, Any]:
+    """One machine-readable snapshot with the same fetches, cache and backoff."""
+    selected = tuple(name for name in PROVIDERS if name in providers)
+    try:
+        selected, _states, data = collect_status(providers, key_command, time.time())
+        return {
+            "version": 1,
+            "providers": [json_provider(name, data.get(name, {})) for name in selected],
+        }
+    except Exception:
+        return error_report(selected)
 
 
 def parse_providers(value: str) -> tuple[str, ...]:
@@ -998,11 +1072,27 @@ def main() -> int:
         help="hide providers whose CLI is not running; this detects running tools in a terminal, "
         "not signed-in accounts or the model a session is using",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one machine-readable JSON object instead of the tmux status line; "
+        "--layout and --hide-inactive do not apply to it",
+    )
     args = parser.parse_args()
     try:
         selected = parse_providers(args.providers)
     except ValueError as error:
         parser.error(str(error))
+    if args.json:
+        # A consumer parses this output, so a runtime failure still prints the documented
+        # shape instead of falling through to the tmux status text.
+        try:
+            report = json_report(selected, args.opencode_key_command)
+            text = json.dumps(report, separators=(",", ":"), allow_nan=False)
+        except Exception:
+            text = json.dumps(error_report(selected), separators=(",", ":"))
+        print(text)
+        return 0
     try:
         if args.tmux_command:
             print(tmux_command(

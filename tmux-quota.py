@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -32,10 +33,16 @@ NO_PLAN_TTL = 3600
 MAX_ERROR_TTL = 1800
 NETWORK_TIMEOUT = 5
 CODEX_TIMEOUT = 15
+KEY_COMMAND_TIMEOUT = 5
 BAR_WIDTH = 8
 PROVIDERS = ("claude", "codex", "opencode-go")
 DEFAULT_PROVIDERS = ("claude", "codex")
 PROVIDER_NAMES = {"claude": "Claude", "codex": "Codex", "opencode-go": "OpenCode Go"}
+UNICODE_ICONS = {"Claude": "⚡", "Codex": "✦", "OpenCode Go": "◈"}
+ASCII_ICONS = {"Claude": "C", "Codex": "X", "OpenCode Go": "O"}
+GAUGE_GLYPHS = "▁▂▃▄▅▆▇█"
+LAYOUTS = ("full", "compact", "minimal", "auto")
+AUTO_ORDER = ("full", "compact", "minimal")
 
 
 def cache_dir() -> Path:
@@ -209,14 +216,77 @@ def fetch_claude(credentials_path: Path, now: float | None = None) -> dict[str, 
     return {"status": "ok", "windows": windows, "updated_at": time.time() if now is None else now}
 
 
-def fetch_opencode_go(now: float | None = None) -> dict[str, Any]:
+def missing_go_key() -> dict[str, Any]:
+    return {"status": "no_key", "error": "OpenCode Go key missing"}
+
+
+def opencode_env_key() -> str | None:
+    """The key exported for the tmux server; blank values count as unset."""
     key = os.environ.get("OPENCODE_API_KEY")
-    if not isinstance(key, str) or not key.strip():
-        return {"status": "no_key", "error": "OpenCode Go key missing"}
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    return None
+
+
+def validated_go_key(raw: bytes) -> str | None:
+    """One printable line of UTF-8 without surrounding whitespace, or None."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if text.endswith("\n"):
+        text = text[:-1]
+        if text.endswith("\r"):
+            text = text[:-1]
+    if not text or text != text.strip() or "\n" in text or "\r" in text:
+        return None
+    if any(not char.isprintable() for char in text):
+        return None
+    return text
+
+
+def opencode_key_command_key(command: str) -> str | None:
+    """Run an arguments-only key command and return its validated key, or None."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    try:
+        completed = subprocess.run(
+            argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=KEY_COMMAND_TIMEOUT,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return validated_go_key(completed.stdout or b"")
+
+
+def opencode_go_key(command: str | None) -> str | None:
+    """Resolve the bearer key: a non-blank environment key wins over the command."""
+    env_key = opencode_env_key()
+    if env_key is not None:
+        return env_key
+    if command:
+        return opencode_key_command_key(command)
+    return None
+
+
+def fetch_opencode_go(now: float | None = None, key_command: str | None = None) -> dict[str, Any]:
+    key = opencode_go_key(key_command)
+    if key is None:
+        return missing_go_key()
     request = urllib.request.Request(
         GO_USAGE_URL,
         headers={
-            "Authorization": f"Bearer {key.strip()}",
+            "Authorization": f"Bearer {key}",
             "Accept": "application/json",
             "User-Agent": GO_USER_AGENT,
         },
@@ -515,6 +585,53 @@ def tmux_text(value: Any) -> str:
     return text[:48]
 
 
+def gauge_cell(percent: float) -> str:
+    """One-cell usage gauge: eight levels, empty at zero and full at 100%."""
+    if percent <= 0:
+        return GAUGE_GLYPHS[0]
+    level = min(len(GAUGE_GLYPHS), max(1, math.ceil(percent * len(GAUGE_GLYPHS) / 100)))
+    return GAUGE_GLYPHS[level - 1]
+
+
+def visible_width(text: str) -> int:
+    """Cells consumed by rendered status text, ignoring tmux style sequences."""
+    plain = re.sub(r"#\[[^\]]*\]", "", text)
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in plain)
+
+
+def threshold_colors(percent: float, limited: bool, use_unicode: bool) -> tuple[str, str]:
+    """Usage colour for the gauge and for the percentage text."""
+    if use_unicode:
+        color = "#9ece6a" if percent < 50 else "#e0af68" if percent < 80 else "#f7768e"
+        return color, "#f7768e" if limited else color
+    color = "colour40" if percent < 50 else "colour220" if percent < 80 else "colour196"
+    return color, "colour196" if limited else color
+
+
+def layout_colors(use_unicode: bool) -> dict[str, str]:
+    """Dim, state, label, countdown and stale colours shared by the dense layouts."""
+    if use_unicode:
+        return {
+            "dim": "#565f89",
+            "state": "#c0caf5",
+            "label": "#c0caf5",
+            "timer": "#a9b1d6",
+            "stale": "#e0af68",
+        }
+    return {
+        "dim": "colour240",
+        "state": "colour245",
+        "label": "colour252",
+        "timer": "colour245",
+        "stale": "colour214",
+    }
+
+
+def numeric_windows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    windows = data.get("windows") if isinstance(data.get("windows"), list) else []
+    return [window for window in windows if isinstance(window.get("percent"), (int, float))]
+
+
 def quota_bar(percent: float, use_unicode: bool = False) -> str:
     filled = min(BAR_WIDTH, max(0, round(percent * BAR_WIDTH / 100)))
     if use_unicode:
@@ -526,11 +643,11 @@ def styled_provider(
     name: str, data: dict[str, Any], now: float, use_unicode: bool = False
 ) -> str:
     if use_unicode:
-        icon = {"Claude": "⚡", "Codex": "✦", "OpenCode Go": "◈"}.get(name, "✦")
+        icon = UNICODE_ICONS.get(name, "✦")
         prefix = f"#[fg=#c0caf5]{icon} {name}:#[default]"
         state_color = "#c0caf5"
     else:
-        icon = {"Claude": "C", "Codex": "X", "OpenCode Go": "O"}.get(name, "?")
+        icon = ASCII_ICONS.get(name, "?")
         prefix = f"#[fg=colour245]{icon} {name}:#[default]"
         state_color = "colour245"
     status = data.get("status")
@@ -557,12 +674,7 @@ def styled_provider(
             continue
         limited = window.get("limited") is True
         marker = " limited" if limited else ""
-        if use_unicode:
-            color = "#9ece6a" if percent < 50 else "#e0af68" if percent < 80 else "#f7768e"
-            percent_color = "#f7768e" if limited else color
-        else:
-            color = "colour40" if percent < 50 else "colour220" if percent < 80 else "colour196"
-            percent_color = "colour196" if limited else color
+        color, percent_color = threshold_colors(percent, limited, use_unicode)
         bar = quota_bar(float(percent), use_unicode)
         remaining = countdown(window.get("reset_at"), now)
         if use_unicode:
@@ -581,6 +693,117 @@ def styled_provider(
     return prefix + (" " + separator.join(rendered) if rendered else f" #[fg={unavailable_color}]unavailable#[default]")
 
 
+def state_marker(data: dict[str, Any], use_unicode: bool) -> str | None:
+    """Dense-layout state text for a provider, or None when windows are drawn."""
+    status = data.get("status")
+    waiting = "\u2026" if use_unicode else "..."
+    if status == "not_running":
+        return ""
+    if status == "syncing":
+        return waiting
+    if status == "no_plan":
+        return "no plan"
+    if status == "no_key":
+        return "no key"
+    if not numeric_windows(data):
+        return waiting if status == "rate_limited" else "?"
+    return None
+
+
+def dense_provider_head(
+    name: str, data: dict[str, Any], use_unicode: bool, colors: dict[str, str]
+) -> tuple[str, str | None]:
+    """Icon head, plus the complete state suffix when no usage windows are drawn."""
+    icon = (UNICODE_ICONS if use_unicode else ASCII_ICONS).get(name, "\u2726" if use_unicode else "?")
+    marker = state_marker(data, use_unicode)
+    if marker == "":
+        return f"#[fg={colors['dim']}]{icon}#[default]", ""
+    head = f"#[fg={colors['state']}]{icon}#[default]"
+    if data.get("stale") or data.get("display_state") == "stale":
+        head += f"#[fg={colors['stale']}]~#[default]"
+    if marker is None:
+        return head, None
+    return head, f" #[fg={colors['state']}]{marker}#[default]"
+
+
+def is_short_window(label: str) -> bool:
+    """True for a short rolling window, judged by the label's duration token."""
+    first = label.split()[0] if label.split() else ""
+    return re.fullmatch(r"\d+[mh]", first) is not None
+
+
+def compact_window(
+    window: dict[str, Any], now: float, use_unicode: bool, colors: dict[str, str]
+) -> str:
+    label = tmux_text(window.get("label", "usage")) or "usage"
+    percent = float(window["percent"])
+    limited = window.get("limited") is True
+    color, percent_color = threshold_colors(percent, limited, use_unicode)
+    marker = "!" if limited else ""
+    short = is_short_window(label)
+    parts = [f"#[fg={colors['label']}]{label}#[default]"]
+    if short and use_unicode:
+        gauge_color = colors["dim"] if percent <= 0 else color
+        parts.append(f"#[fg={gauge_color}]{gauge_cell(percent)}#[default]")
+    parts.append(f"#[fg={percent_color}]{percent:.0f}%{marker}#[default]")
+    remaining = countdown(window.get("reset_at"), now)
+    if remaining and (short or limited or percent >= 80):
+        parts.append(f"#[fg={colors['timer']}]{remaining}#[default]")
+    return " ".join(parts)
+
+
+def compact_provider(name: str, data: dict[str, Any], now: float, use_unicode: bool) -> str:
+    colors = layout_colors(use_unicode)
+    head, state = dense_provider_head(name, data, use_unicode, colors)
+    if state is not None:
+        return head + state
+    join = " #[fg=#7a83a5]\u00b7#[default] " if use_unicode else " / "
+    windows = numeric_windows(data)
+    rendered = [compact_window(window, now, use_unicode, colors) for window in windows]
+    return head + " " + join.join(rendered)
+
+
+def minimal_provider(name: str, data: dict[str, Any], use_unicode: bool) -> str:
+    colors = layout_colors(use_unicode)
+    head, state = dense_provider_head(name, data, use_unicode, colors)
+    if state is not None:
+        return head + state
+    windows = numeric_windows(data)
+    highest = max(float(window["percent"]) for window in windows)
+    is_limited = any(window.get("limited") is True for window in windows)
+    _, percent_color = threshold_colors(highest, is_limited, use_unicode)
+    bang = "!" if is_limited else ""
+    return f"{head} #[fg={percent_color}]{highest:.0f}%{bang}#[default]"
+
+
+def layout_separator(layout: str, use_unicode: bool) -> str:
+    if layout == "full":
+        return "  #[fg=#7a83a5]\u00b7#[default]  " if use_unicode else "  #[fg=colour238]|#[default]  "
+    if use_unicode:
+        return "  #[fg=#7a83a5]\u2502#[default]  "
+    return "  #[fg=colour238]|#[default]  "
+
+
+def render_layout(
+    layout: str,
+    states: dict[str, bool],
+    data: dict[str, dict[str, Any]],
+    selected: list[str],
+    now: float,
+    use_unicode: bool,
+) -> str:
+    rendered = []
+    for name in selected:
+        entry = data[name] if states.get(name) else {"status": "not_running"}
+        if layout == "minimal":
+            rendered.append(minimal_provider(PROVIDER_NAMES[name], entry, use_unicode))
+        elif layout == "compact":
+            rendered.append(compact_provider(PROVIDER_NAMES[name], entry, now, use_unicode))
+        else:
+            rendered.append(styled_provider(PROVIDER_NAMES[name], entry, now, use_unicode))
+    return layout_separator(layout, use_unicode).join(rendered)
+
+
 def render_status(
     states: dict[str, bool],
     claude: dict[str, Any],
@@ -589,20 +812,32 @@ def render_status(
     use_unicode: bool = False,
     providers: tuple[str, ...] = DEFAULT_PROVIDERS,
     opencode_go: dict[str, Any] | None = None,
+    layout: str = "full",
+    max_width: int | None = None,
 ) -> str:
     current = time.time() if now is None else now
-    separator = "  #[fg=#7a83a5]·#[default]  " if use_unicode else "  #[fg=colour238]|#[default]  "
     data = {"claude": claude, "codex": codex, "opencode-go": opencode_go or {}}
-    rendered = []
-    for name in PROVIDERS:
-        if name not in providers:
-            continue
-        entry = data[name] if states.get(name) else {"status": "not_running"}
-        rendered.append(styled_provider(PROVIDER_NAMES[name], entry, current, use_unicode))
-    return separator.join(rendered)
+    selected = [name for name in PROVIDERS if name in providers]
+    if layout not in LAYOUTS:
+        layout = "full"
+    if layout == "auto":
+        if isinstance(max_width, int):
+            for candidate in AUTO_ORDER:
+                text = render_layout(candidate, states, data, selected, current, use_unicode)
+                if visible_width(text) <= max_width:
+                    return text
+            return render_layout("minimal", states, data, selected, current, use_unicode)
+        layout = "compact"
+    return render_layout(layout, states, data, selected, current, use_unicode)
 
 
-def run_status(use_unicode: bool = False, providers: tuple[str, ...] = DEFAULT_PROVIDERS) -> str:
+def run_status(
+    use_unicode: bool = False,
+    providers: tuple[str, ...] = DEFAULT_PROVIDERS,
+    layout: str = "full",
+    max_width: int | None = None,
+    key_command: str | None = None,
+) -> str:
     now = time.time()
     selected = tuple(name for name in PROVIDERS if name in providers)
     states = process_states(selected)
@@ -619,7 +854,11 @@ def run_status(use_unicode: bool = False, providers: tuple[str, ...] = DEFAULT_P
         elif name == "codex":
             data[name] = provider_data("codex", active, now, lambda: fetch_codex(helper), root)
         else:
-            data[name] = provider_data("opencode-go", active, now, lambda: fetch_opencode_go(now), root)
+            fetcher = (
+                (lambda: fetch_opencode_go(now, key_command)) if key_command
+                else (lambda: fetch_opencode_go(now))
+            )
+            data[name] = provider_data("opencode-go", active, now, fetcher, root)
     return render_status(
         states,
         data.get("claude", {}),
@@ -628,6 +867,8 @@ def run_status(use_unicode: bool = False, providers: tuple[str, ...] = DEFAULT_P
         use_unicode,
         selected,
         data.get("opencode-go"),
+        layout,
+        max_width,
     )
 
 
@@ -644,14 +885,31 @@ def parse_providers(value: str) -> tuple[str, ...]:
 
 
 def tmux_command(
-    path: Path, use_unicode: bool = False, providers: tuple[str, ...] = DEFAULT_PROVIDERS
+    path: Path,
+    use_unicode: bool = False,
+    providers: tuple[str, ...] = DEFAULT_PROVIDERS,
+    layout: str = "full",
+    max_width: int | None = None,
+    key_command: str | None = None,
 ) -> str:
-    flag = " --unicode" if use_unicode else ""
+    flags = []
+    if use_unicode:
+        flags.append("--unicode")
+    if layout and layout != "full":
+        flags.append("--layout " + shlex.quote(layout))
+    if max_width is not None:
+        flags.append("--max-width " + shlex.quote(str(int(max_width))))
     selected = tuple(name for name in PROVIDERS if name in providers)
-    provider_flag = ""
     if selected and selected != DEFAULT_PROVIDERS:
-        provider_flag = " --providers " + shlex.quote(",".join(selected))
-    return "#(python3 " + shlex.quote(str(path.resolve())) + flag + provider_flag + ")"
+        flags.append("--providers " + shlex.quote(",".join(selected)))
+    if key_command:
+        flags.append("--opencode-key-command " + shlex.quote(key_command))
+    return (
+        "#(python3 "
+        + shlex.quote(str(path.resolve()))
+        + "".join(" " + flag for flag in flags)
+        + ")"
+    )
 
 
 def main() -> int:
@@ -664,6 +922,25 @@ def main() -> int:
         help="comma-separated providers to show: " + ", ".join(PROVIDERS)
         + " (default: " + ",".join(DEFAULT_PROVIDERS) + ")",
     )
+    parser.add_argument(
+        "--layout",
+        choices=LAYOUTS,
+        default="full",
+        help="render density: full (default), compact, minimal, or auto by --max-width",
+    )
+    parser.add_argument(
+        "--max-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="cells available for the quota text; selects the layout for --layout auto",
+    )
+    parser.add_argument(
+        "--opencode-key-command",
+        default=None,
+        metavar="CMD",
+        help="command whose first output line is the OpenCode Go key when OPENCODE_API_KEY is unset",
+    )
     args = parser.parse_args()
     try:
         selected = parse_providers(args.providers)
@@ -671,12 +948,22 @@ def main() -> int:
         parser.error(str(error))
     try:
         if args.tmux_command:
-            print(tmux_command(Path(__file__), args.unicode, selected))
-        elif selected == DEFAULT_PROVIDERS:
+            print(tmux_command(
+                Path(__file__), args.unicode, selected, args.layout, args.max_width,
+                args.opencode_key_command,
+            ))
+        elif (
+            selected == DEFAULT_PROVIDERS
+            and args.layout == "full"
+            and args.max_width is None
+            and not args.opencode_key_command
+        ):
             # The default path keeps its original single-argument call.
             print(run_status(args.unicode))
         else:
-            print(run_status(args.unicode, selected))
+            print(run_status(
+                args.unicode, selected, args.layout, args.max_width, args.opencode_key_command
+            ))
     except Exception:
         print("#[fg=colour245]Quota unavailable#[default]")
     return 0

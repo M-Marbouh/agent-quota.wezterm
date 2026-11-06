@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1335,6 +1336,680 @@ class OpenCodeGoTests(unittest.TestCase):
         stale = self._render({"status": "error", "windows": [{"label": "5h", "percent": 12}], "stale": True})
         self.assertIn("stale", stale)
         self.assertIn("12%", stale)
+
+
+class OpenCodeKeyCommandTests(unittest.TestCase):
+    """The optional command that supplies the OpenCode Go key on demand."""
+
+    COMMAND = "mcpctl vault get opencode-go-api-main"
+    KEY = "command-supplied-key-5c1e9a7d3b2f80461c8d5e9a"
+    PROVIDERS = ("claude", "codex", "opencode-go")
+
+    @staticmethod
+    def _completed(stdout=b"", returncode=0):
+        return subprocess.CompletedProcess([], returncode, stdout, b"")
+
+    def _env(self, key):
+        return OpenCodeGoTests._env(key)
+
+    def _response(self, body):
+        return OpenCodeGoTests._response(body)
+
+    def test_key_command_supplies_the_bearer_token_without_leaking_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self._env(None), \
+                 mock.patch.object(
+                     quota.subprocess, "run", return_value=self._completed(self.KEY.encode() + b"\n"),
+                 ) as run, \
+                 mock.patch.object(
+                     quota.urllib.request, "urlopen",
+                     return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                 ) as urlopen:
+                data = quota.provider_data(
+                    "opencode-go", True, 100,
+                    lambda: quota.fetch_opencode_go(100, self.COMMAND), root,
+                )
+            cache_text = (root / "opencode-go.json").read_text()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(len(data["windows"]), 3)
+        run.assert_called_once()
+        argv, kwargs = run.call_args
+        self.assertEqual(argv[0], ["mcpctl", "vault", "get", "opencode-go-api-main"])
+        self.assertIs(kwargs["shell"], False)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], quota.KEY_COMMAND_TIMEOUT)
+        urlopen.assert_called_once()
+        request = urlopen.call_args[0][0]
+        self.assertEqual(request.get_header("Authorization"), f"Bearer {self.KEY}")
+        rendered = quota.render_status(
+            {"opencode-go": True}, {}, {}, now=100, use_unicode=True,
+            providers=("opencode-go",), opencode_go=data,
+        )
+        for where, haystack in {
+            "cache file": cache_text,
+            "result": repr(data),
+            "serialized": json.dumps(data),
+            "rendered": rendered,
+            "argv": repr(run.call_args),
+        }.items():
+            self.assertNotIn(self.KEY, haystack, where)
+
+    def test_failed_lookup_reports_no_key_and_still_renders_other_providers(self):
+        claude = {"status": "ok", "windows": [{"label": "5h", "percent": 11, "reset_at": 5000}]}
+        codex = {"status": "ok", "windows": [{"label": "5h", "percent": 22, "reset_at": 5000}]}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(quota, "process_states", return_value={
+                 "claude": True, "codex": True, "opencode-go": True,
+             }), \
+             mock.patch.object(quota, "cache_dir", return_value=Path(directory)), \
+             mock.patch.object(quota, "fetch_claude", return_value=claude), \
+             mock.patch.object(quota, "fetch_codex", return_value=codex), \
+             mock.patch.object(quota.subprocess, "run", return_value=self._completed(b"", 2)) as run, \
+             mock.patch.object(quota.urllib.request, "urlopen") as urlopen, \
+             self._env(None), \
+             mock.patch.object(quota.time, "time", return_value=1):
+            text = quota.run_status(True, self.PROVIDERS, "full", None, self.COMMAND)
+            cache_files = {path.name for path in Path(directory).iterdir()}
+        run.assert_called_once()
+        urlopen.assert_not_called()
+        self.assertIn("no key", text)
+        self.assertIn("11%", text)
+        self.assertIn("22%", text)
+        self.assertIn("Claude:", text)
+        self.assertIn("Codex:", text)
+        self.assertNotIn("not running", text)
+        self.assertEqual(cache_files, {
+            "claude.json", "claude.lock", "codex.json", "codex.lock",
+            "opencode-go.json", "opencode-go.lock",
+        })
+
+    def test_key_command_never_runs_when_the_lookup_is_not_needed(self):
+        windows = {"status": "ok", "windows": [{"label": "5h", "percent": 10, "reset_at": 5000}]}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(quota, "cache_dir", return_value=Path(directory)), \
+             mock.patch.object(quota, "fetch_opencode_go", return_value=windows) as fetch_go, \
+             mock.patch.object(quota.subprocess, "run") as run, \
+             self._env(None), \
+             mock.patch.object(quota.time, "time", return_value=1):
+            with mock.patch.object(quota, "process_states", return_value={"claude": True}), \
+                 mock.patch.object(quota, "fetch_claude", return_value=windows):
+                unselected = quota.run_status(False, ("claude",), "full", None, self.COMMAND)
+            with mock.patch.object(quota, "process_states", return_value={"opencode-go": False}):
+                inactive = quota.run_status(False, ("opencode-go",), "full", None, self.COMMAND)
+            Path(directory).joinpath("opencode-go.json").write_text(json.dumps({
+                **windows, "next_refresh_at": 10_000, "error_count": 0,
+            }))
+            with mock.patch.object(quota, "process_states", return_value={"opencode-go": True}) as states:
+                fresh = quota.run_status(False, ("opencode-go",), "full", None, self.COMMAND)
+            self.assertEqual(states.call_count, 1)
+            Path(directory).joinpath("opencode-go.json").unlink()
+            with mock.patch.object(quota, "process_states", return_value={"opencode-go": True}):
+                with quota.RefreshLock(Path(directory) / "opencode-go.lock") as held:
+                    self.assertTrue(held)
+                    locked = quota.run_status(False, ("opencode-go",), "full", None, self.COMMAND)
+        run.assert_not_called()
+        self.assertIn("Claude:", unselected)
+        self.assertNotIn("OpenCode", unselected)
+        self.assertIn("not running", inactive)
+        self.assertIn("10%", fresh)
+        self.assertIn("syncing", locked)
+        fetch_go.assert_not_called()
+
+    def test_nonblank_environment_key_wins_over_the_command(self):
+        with self._env(GO_KEY), \
+             mock.patch.object(quota.subprocess, "run") as run, \
+             mock.patch.object(
+                 quota.urllib.request, "urlopen",
+                 return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+             ) as urlopen:
+            data = quota.fetch_opencode_go(100, self.COMMAND)
+        self.assertEqual(data["status"], "ok")
+        run.assert_not_called()
+        urlopen.assert_called_once()
+        self.assertEqual(
+            urlopen.call_args[0][0].get_header("Authorization"), f"Bearer {GO_KEY}"
+        )
+
+    def test_blank_environment_key_falls_back_to_the_command(self):
+        token = "fallback-command-key-71b3e0c9"
+        for blank in ("", "   ", "\t\n"):
+            with self.subTest(env=repr(blank)):
+                with self._env(blank), \
+                     mock.patch.object(
+                         quota.subprocess, "run",
+                         return_value=self._completed(token.encode() + b"\n"),
+                     ) as run, \
+                     mock.patch.object(
+                         quota.urllib.request, "urlopen",
+                         return_value=self._response(json.dumps(GO_FIXTURE).encode()),
+                     ) as urlopen:
+                    data = quota.fetch_opencode_go(100, self.COMMAND)
+                self.assertEqual(data["status"], "ok")
+                run.assert_called_once()
+                self.assertEqual(
+                    urlopen.call_args[0][0].get_header("Authorization"), f"Bearer {token}"
+                )
+
+    def test_blank_environment_key_without_a_command_still_reports_no_key(self):
+        with self._env("  "), \
+             mock.patch.object(quota.subprocess, "run") as run, \
+             mock.patch.object(quota.urllib.request, "urlopen") as urlopen:
+            data = quota.fetch_opencode_go(100)
+        self.assertEqual(data, {"status": "no_key", "error": "OpenCode Go key missing"})
+        run.assert_not_called()
+        urlopen.assert_not_called()
+
+    def test_key_command_failure_matrix_reports_no_key_without_http(self):
+        timeout = subprocess.TimeoutExpired(self.COMMAND, 5)
+        cases = [
+            ("unbalanced quote", "tool 'unclosed", {}, False),
+            ("missing executable", self.COMMAND, {"side_effect": FileNotFoundError("missing")}, True),
+            ("timeout", self.COMMAND, {"side_effect": timeout}, True),
+            ("nonzero exit", self.COMMAND, {"return_value": self._completed(b"", 2)}, True),
+            ("invalid utf-8", self.COMMAND, {"return_value": self._completed(b"\xff\xfe\n")}, True),
+            ("empty", self.COMMAND, {"return_value": self._completed(b"")}, True),
+            ("newline only", self.COMMAND, {"return_value": self._completed(b"\n")}, True),
+            ("embedded newline", self.COMMAND, {"return_value": self._completed(b"a\nb\n")}, True),
+            ("carriage return", self.COMMAND, {"return_value": self._completed(b"a\rb")}, True),
+            ("control character", self.COMMAND, {"return_value": self._completed(b"a\x07b\n")}, True),
+            ("leading space", self.COMMAND, {"return_value": self._completed(b" key\n")}, True),
+            ("trailing space", self.COMMAND, {"return_value": self._completed(b"key \n")}, True),
+            ("space only", self.COMMAND, {"return_value": self._completed(b" \n")}, True),
+        ]
+        for label, command, run_kwargs, executes in cases:
+            with self.subTest(case=label):
+                with self._env(None), \
+                     mock.patch.object(quota.subprocess, "run", **run_kwargs) as run, \
+                     mock.patch.object(quota.urllib.request, "urlopen") as urlopen:
+                    data = quota.fetch_opencode_go(100, command)
+                self.assertEqual(data, {"status": "no_key", "error": "OpenCode Go key missing"})
+                urlopen.assert_not_called()
+                self.assertEqual(run.call_count, 1 if executes else 0)
+
+    def test_key_command_accepts_one_trailing_line_ending(self):
+        for raw in (b"key-value", b"key-value\n", b"key-value\r\n"):
+            with self.subTest(raw=raw):
+                self.assertEqual(quota.validated_go_key(raw), "key-value")
+        for raw in (b"", b"\n", b"\r\n", b"a\nb", b"key value\n\n", b" key", b"key ", b"\xc3\x28"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(quota.validated_go_key(raw))
+
+    def test_tmux_command_quotes_the_option_without_running_it(self):
+        with mock.patch.object(quota.subprocess, "run") as run:
+            line = quota.tmux_command(
+                SOURCE, True, self.PROVIDERS, "compact", None, self.COMMAND
+            )
+        run.assert_not_called()
+        self.assertIn("--opencode-key-command " + shlex.quote(self.COMMAND), line)
+        self.assertTrue(line.endswith(")"))
+        self.assertIn("--layout compact", line)
+        self.assertIn("--providers claude,codex,opencode-go", line)
+        tricky = "tool with 'quote' and space"
+        quoted = quota.tmux_command(SOURCE, False, quota.DEFAULT_PROVIDERS, "full", None, tricky)
+        self.assertIn(shlex.quote(tricky), quoted)
+        self.assertIn("'\"'\"'", quoted)
+        default = quota.tmux_command(SOURCE)
+        self.assertNotIn("--opencode-key-command", default)
+        completed = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command", "--unicode", "--layout", "compact",
+             "--providers", "claude,codex,opencode-go",
+             "--opencode-key-command", self.COMMAND],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(completed.stdout.strip(), line)
+        self.assertNotIn("command-supplied", completed.stdout)
+
+    def test_cli_passes_the_key_command_into_the_run(self):
+        output = io.StringIO()
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as run_status, \
+             mock.patch.object(
+                 sys, "argv",
+                 [str(SOURCE), "--providers", "opencode-go", "--opencode-key-command", self.COMMAND],
+             ), contextlib.redirect_stdout(output):
+            self.assertEqual(quota.main(), 0)
+        run_status.assert_called_once_with(
+            False, ("opencode-go",), "full", None, self.COMMAND
+        )
+        self.assertEqual(output.getvalue(), "STATUS\n")
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as default_run, \
+             mock.patch.object(sys, "argv", [str(SOURCE)]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(quota.main(), 0)
+        default_run.assert_called_once_with(False)
+
+
+class LayoutTests(unittest.TestCase):
+    """Dense layouts: compact, minimal, and width-driven auto selection."""
+
+    NOW = 1793969150
+    ALL = ("claude", "codex", "opencode-go")
+    # Records captured from the live cache, rendered with a fixed clock.
+    CLAUDE = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 3.0, "reset_at": 1793986200.457986},
+        {"label": "7d", "percent": 3.0, "reset_at": 1794564000.458007},
+    ]}
+    CODEX = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 7.0, "reset_at": 1793987009.0},
+        {"label": "7d", "percent": 22.0, "reset_at": 1794506129.0},
+    ]}
+    GO = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 0.0, "reset_at": 1793986584.0},
+        {"label": "7d", "percent": 1.0, "reset_at": 1794182400.0},
+        {"label": "mo", "percent": 0.0, "reset_at": 1796503387.0},
+    ]}
+    SAMPLE_CLAUDE = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 2.0, "reset_at": 1793986750},
+        {"label": "7d", "percent": 2.0, "reset_at": 1794564000},
+    ]}
+    SAMPLE_CODEX = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 47.0, "reset_at": 1793970950},
+        {"label": "7d", "percent": 20.0, "reset_at": 1794506129},
+    ]}
+
+    @staticmethod
+    def _plain(text):
+        return re.sub(r"#\[[^\]]*\]", "", text)
+
+    def _render(self, layout="full", *, unicode=True, provider_set=None, max_width=None,
+                claude=None, codex=None, go=None):
+        provider_set = self.ALL if provider_set is None else provider_set
+        states = {name: True for name in provider_set}
+        return quota.render_status(
+            states,
+            self.CLAUDE if claude is None else claude,
+            self.CODEX if codex is None else codex,
+            self.NOW,
+            unicode,
+            provider_set,
+            self.GO if go is None else go,
+            layout,
+            max_width,
+        )
+
+    def test_omitted_layout_stays_byte_identical_to_full(self):
+        fixtures = [
+            (self.CLAUDE, self.CODEX, self.GO),
+            ({"status": "ok", "windows": [{"label": "5h", "percent": 42, "reset_at": 1794000000}]},
+             {"status": "ok", "windows": [{"label": "1h", "percent": 85, "reset_at": 1793970000},
+                                          {"label": "30d", "percent": 79, "reset_at": 1799000000}]},
+             {"status": "ok", "windows": [{"label": "5h", "percent": 12.6, "reset_at": 1793970000}]}),
+            ({"status": "error", "windows": [{"label": "5h", "percent": 12}], "stale": True},
+             {"status": "ok", "windows": [{"label": "5h", "percent": 0}], "display_state": "stale"},
+             {"status": "error", "windows": [], "stale": True}),
+            ({"status": "syncing", "windows": []}, {"status": "not_running"},
+             {"status": "no_plan", "windows": []}),
+            ({"status": "ok", "windows": [{"label": "5h", "percent": 21, "reset_at": 1793970000,
+                                           "limited": True}]},
+             {"status": "ok", "windows": [{"label": "5h", "percent": 100, "reset_at": 1793970000}]},
+             {"status": "no_key", "windows": []}),
+        ]
+        provider_sets = [("claude", "codex"), ("claude",), ("codex", "opencode-go"), self.ALL]
+        checked = 0
+        for unicode_mode in (False, True):
+            for claude, codex, go in fixtures:
+                for provider_set in provider_sets:
+                    states = {name: True for name in provider_set}
+                    omitted = quota.render_status(
+                        states, claude, codex, self.NOW, unicode_mode, provider_set, go
+                    )
+                    explicit = quota.render_status(
+                        states, claude, codex, self.NOW, unicode_mode, provider_set, go, "full"
+                    )
+                    with_budget = quota.render_status(
+                        states, claude, codex, self.NOW, unicode_mode, provider_set, go, "full", 12
+                    )
+                    self.assertEqual(omitted, explicit)
+                    self.assertEqual(omitted, with_budget)
+                    checked += 1
+        self.assertEqual(checked, 40)
+
+    def test_compact_sample_renders_without_provider_names(self):
+        text = self._render("compact", claude=self.SAMPLE_CLAUDE, codex=self.SAMPLE_CODEX)
+        self.assertEqual(
+            self._plain(text),
+            "⚡ 5h ▁ 2% 4h53m · 7d 2%  │  ✦ 5h ▄ 47% 30m · 7d 20%  │  ◈ 5h ▁ 0% 4h50m · 7d 1% · mo 0%",
+        )
+        self.assertEqual(quota.visible_width(text), 88)
+
+    def test_compact_never_silently_falls_back_to_full(self):
+        compact = self._render("compact")
+        full = self._render("full")
+        for name in ("Claude", "Codex", "OpenCode Go"):
+            self.assertNotIn(name, compact)
+            self.assertIn(name, full)
+        self.assertNotIn("░", compact)
+        self.assertNotIn("█", compact)
+        self.assertNotIn("(", compact)
+        self.assertNotIn(")", compact)
+        self.assertLess(quota.visible_width(compact), quota.visible_width(full) - 100)
+        self.assertNotEqual(self._plain(compact), self._plain(full))
+
+    def test_compact_ascii_uses_identifiers_and_no_gauge(self):
+        text = self._render("compact", unicode=False, claude=self.SAMPLE_CLAUDE,
+                            codex=self.SAMPLE_CODEX)
+        self.assertEqual(
+            self._plain(text),
+            "C 5h 2% 4h53m / 7d 2%  |  X 5h 47% 30m / 7d 20%  |  O 5h 0% 4h50m / 7d 1% / mo 0%",
+        )
+        for glyph in quota.GAUGE_GLYPHS:
+            self.assertNotIn(glyph, text)
+        self.assertNotIn("│", text)
+
+    def test_compact_window_visibility_rules_and_colors(self):
+        claude = {"status": "ok", "windows": [
+            {"label": "5h", "percent": 10.0, "reset_at": 1793986750},
+            {"label": "7d", "percent": 79.0, "reset_at": 1794564000},
+        ]}
+        codex = {"status": "ok", "windows": [
+            {"label": "1h", "percent": 85.0, "reset_at": 1793970950},
+            {"label": "30d", "percent": 20.0, "reset_at": 1794506129},
+        ]}
+        text = self._render("compact", provider_set=("claude", "codex"), claude=claude, codex=codex)
+        plain = self._plain(text)
+        self.assertIn("5h ▁ 10% 4h53m", plain)
+        self.assertIn("7d 79%", plain)
+        self.assertNotIn("7d 79% 58d", plain)
+        self.assertIn("1h ▇ 85% 30m", plain)
+        self.assertIn("30d 20%", plain)
+        for fragment in (
+            "#[fg=#9ece6a]▁#[default] #[fg=#9ece6a]10%#[default]",
+            "#[fg=#e0af68]79%#[default]",
+            "#[fg=#f7768e]▇#[default] #[fg=#f7768e]85%#[default]",
+        ):
+            self.assertIn(fragment, text)
+        stale_free = {"status": "ok", "windows": [
+            {"label": "5h", "percent": 21.0, "reset_at": 1793986750, "limited": True},
+            {"label": "7d", "percent": 20.0, "reset_at": 1794564000},
+        ]}
+        limited = self._render("compact", provider_set=("claude",), claude=stale_free, codex={}, go={})
+        self.assertIn("#[fg=#f7768e]21%!#[default]", limited)
+        self.assertEqual(self._plain(limited), "⚡ 5h ▂ 21%! 4h53m · 7d 20%")
+
+    def test_short_windows_are_chosen_by_label_not_position(self):
+        self.assertTrue(quota.is_short_window("5h"))
+        self.assertTrue(quota.is_short_window("45m"))
+        self.assertFalse(quota.is_short_window("7d"))
+        self.assertFalse(quota.is_short_window("1d"))
+        self.assertFalse(quota.is_short_window("mo"))
+        self.assertFalse(quota.is_short_window("usage"))
+        self.assertFalse(quota.is_short_window("7d opus"))
+        self.assertFalse(quota.is_short_window("now"))
+        self.assertFalse(quota.is_short_window(""))
+        weekly_only = {"status": "ok", "windows": [
+            {"label": "7d", "percent": 10.0, "reset_at": 1794564000},
+        ]}
+        monthly_only = {"status": "ok", "windows": [
+            {"label": "mo", "percent": 10.0, "reset_at": 1796503387},
+        ]}
+        for label, data, expected in (
+            ("weekly only", weekly_only, "◈ 7d 10%"),
+            ("monthly only", monthly_only, "◈ mo 10%"),
+        ):
+            with self.subTest(case=label):
+                text = self._render("compact", provider_set=("opencode-go",), claude={},
+                                    codex={}, go=data)
+                self.assertEqual(self._plain(text), expected)
+                for glyph in quota.GAUGE_GLYPHS:
+                    self.assertNotIn(glyph, text)
+        mixed = {"status": "ok", "windows": [
+            {"label": "1h", "percent": 10.0, "reset_at": 1793970950},
+            {"label": "7d", "percent": 20.0, "reset_at": 1794506129},
+        ]}
+        text = self._render("compact", provider_set=("codex",), claude={}, codex=mixed, go={})
+        self.assertEqual(self._plain(text), "✦ 1h ▁ 10% 30m · 7d 20%")
+        self.assertEqual(text.count("▁"), 1)
+        suffixed = {"status": "ok", "windows": [
+            {"label": "7d opus", "percent": 10.0, "reset_at": 1794564000},
+        ]}
+        text = self._render("compact", provider_set=("claude",), claude=suffixed, codex={}, go={})
+        self.assertEqual(self._plain(text), "⚡ 7d opus 10%")
+        for glyph in quota.GAUGE_GLYPHS:
+            self.assertNotIn(glyph, text)
+        long_at_85 = {"status": "ok", "windows": [
+            {"label": "7d", "percent": 85.0, "reset_at": 1794564000},
+        ]}
+        text = self._render("compact", provider_set=("claude",), claude=long_at_85, codex={}, go={})
+        self.assertEqual(self._plain(text), "⚡ 7d 85% 6d21h")
+
+    def test_short_window_gauge_and_countdown_survive_a_long_first_window(self):
+        windows = {"status": "ok", "windows": [
+            {"label": "7d", "percent": 20.0, "reset_at": 1794564000},
+            {"label": "5h", "percent": 10.0, "reset_at": 1793970950},
+        ]}
+        text = self._render("compact", provider_set=("claude",), claude=windows, codex={}, go={})
+        self.assertEqual(self._plain(text), "⚡ 7d 20% · 5h ▁ 10% 30m")
+        self.assertEqual(text.count("▁"), 1)
+
+    def test_dense_ascii_output_stays_ascii_only(self):
+        markers = {
+            "healthy": {"status": "ok", "windows": [
+                {"label": "5h", "percent": 12.0, "reset_at": 1793970950},
+                {"label": "7d", "percent": 93.0, "reset_at": 1794564000},
+            ]},
+            "limited": {"status": "ok", "windows": [
+                {"label": "5h", "percent": 12.0, "reset_at": 1793970950, "limited": True},
+            ]},
+            "stale": {"status": "error", "stale": True, "windows": [
+                {"label": "5h", "percent": 12.0, "reset_at": 1793970950},
+            ]},
+            "stale-display": {"status": "ok", "display_state": "stale", "windows": [
+                {"label": "5h", "percent": 12.0},
+            ]},
+            "not_running": {"status": "not_running"},
+            "syncing": {"status": "syncing", "windows": []},
+            "rate_limited": {"status": "rate_limited", "windows": []},
+            "no_plan": {"status": "no_plan", "windows": []},
+            "no_key": {"status": "no_key", "windows": []},
+            "unavailable": {"status": "error", "windows": []},
+        }
+        for layout in ("compact", "minimal"):
+            for name, data in markers.items():
+                with self.subTest(layout=layout, case=name):
+                    for provider_set, claude, codex, go in (
+                        (("claude",), data, {}, {}),
+                        (self.ALL, data, data, data),
+                    ):
+                        text = self._render(layout, unicode=False, provider_set=provider_set,
+                                            claude=claude, codex=codex, go=go)
+                        visible = self._plain(text)
+                        self.assertTrue(visible.isascii(), visible)
+                        self.assertNotIn("…", visible)
+                        self.assertNotIn("·", visible)
+                        self.assertNotIn("│", visible)
+                        self.assertTrue(text.endswith("#[default]"))
+        self.assertEqual(self._plain(self._render("compact", unicode=False,
+                                                 provider_set=("claude",),
+                                                 claude={"status": "syncing", "windows": []},
+                                                 codex={}, go={})), "C ...")
+        self.assertEqual(self._plain(self._render("minimal", unicode=False,
+                                                 provider_set=("claude",),
+                                                 claude={"status": "rate_limited", "windows": []},
+                                                 codex={}, go={})), "C ...")
+
+    def test_gauge_level_boundaries(self):
+        self.assertEqual(quota.gauge_cell(0), "▁")
+        self.assertEqual(quota.gauge_cell(0.4), "▁")
+        self.assertEqual(quota.gauge_cell(12.5), "▁")
+        self.assertEqual(quota.gauge_cell(12.6), "▂")
+        self.assertEqual(quota.gauge_cell(25), "▂")
+        self.assertEqual(quota.gauge_cell(37.5), "▃")
+        self.assertEqual(quota.gauge_cell(100), "█")
+        self.assertEqual(quota.gauge_cell(150), "█")
+        self.assertEqual(quota.gauge_cell(-25), "▁")
+        self.assertEqual([quota.gauge_cell(level * 12.5) for level in range(1, 9)],
+                         list("▁▂▃▄▅▆▇█"))
+
+    def test_minimal_shows_highest_percent_and_flags_any_limited_window(self):
+        claude = {"status": "ok", "windows": [
+            {"label": "5h", "percent": 5.0, "reset_at": 1793986750, "limited": True},
+            {"label": "7d", "percent": 95.0, "reset_at": 1794564000},
+        ]}
+        text = self._render("minimal", provider_set=("claude",), claude=claude, codex={}, go={})
+        self.assertEqual(self._plain(text), "⚡ 95%!")
+        self.assertEqual(text, "#[fg=#c0caf5]⚡#[default] #[fg=#f7768e]95%!#[default]")
+        healthy = {"status": "ok", "windows": [
+            {"label": "5h", "percent": 5.0}, {"label": "7d", "percent": 95.0},
+        ]}
+        plain_healthy = self._render("minimal", provider_set=("claude",), claude=healthy,
+                                     codex={}, go={})
+        self.assertEqual(plain_healthy, "#[fg=#c0caf5]⚡#[default] #[fg=#f7768e]95%#[default]")
+        mid = {"status": "ok", "windows": [{"label": "5h", "percent": 42.0}]}
+        self.assertEqual(
+            self._render("minimal", provider_set=("claude",), claude=mid, codex={}, go={}),
+            "#[fg=#c0caf5]⚡#[default] #[fg=#9ece6a]42%#[default]",
+        )
+
+    def test_minimal_uses_highest_percent_without_countdown(self):
+        text = self._render("minimal")
+        self.assertEqual(self._plain(text), "⚡ 3%  │  ✦ 22%  │  ◈ 1%")
+        self.assertNotIn("d", self._plain(text).replace("│", ""))
+        ascii_text = self._render("minimal", unicode=False)
+        self.assertEqual(self._plain(ascii_text), "C 3%  |  X 22%  |  O 1%")
+
+    def test_state_markers_are_distinct_in_compact_and_minimal(self):
+        markers = {
+            "not_running": {"status": "not_running"},
+            "syncing": {"status": "syncing", "windows": []},
+            "rate_limited": {"status": "rate_limited", "windows": []},
+            "no_plan": {"status": "no_plan", "windows": []},
+            "no_key": {"status": "no_key", "windows": []},
+            "unavailable": {"status": "error", "windows": []},
+        }
+        expected = {
+            "not_running": "⚡",
+            "syncing": "⚡ …",
+            "rate_limited": "⚡ …",
+            "no_plan": "⚡ no plan",
+            "no_key": "⚡ no key",
+            "unavailable": "⚡ ?",
+        }
+        for layout in ("compact", "minimal"):
+            seen = set()
+            for name, data in markers.items():
+                text = self._render(layout, provider_set=("claude",), claude=data, codex={}, go={})
+                self.assertEqual(self._plain(text), expected[name], name)
+                self.assertTrue(text.endswith("#[default]"))
+                seen.add(self._plain(text))
+            self.assertIn("⚡", seen)
+            self.assertEqual(len(seen), len(markers) - 1)
+        dim_idle = self._render("compact", provider_set=("claude",),
+                                claude={"status": "not_running"}, codex={}, go={})
+        self.assertEqual(dim_idle, "#[fg=#565f89]⚡#[default]")
+        stale_compact = self._render(
+            "compact", provider_set=("claude",),
+            claude={"status": "error", "windows": [{"label": "5h", "percent": 12,
+                                                    "reset_at": 1794000000}], "stale": True},
+            codex={}, go={},
+        )
+        self.assertEqual(self._plain(stale_compact), "⚡~ 5h ▁ 12% 8h34m")
+        self.assertIn("#[fg=#e0af68]~#[default]", stale_compact)
+        stale_minimal = self._render(
+            "minimal", provider_set=("claude",),
+            claude={"status": "error", "windows": [{"label": "5h", "percent": 12}], "display_state": "stale"},
+            codex={}, go={},
+        )
+        self.assertEqual(self._plain(stale_minimal), "⚡~ 12%")
+
+    def test_auto_picks_the_first_layout_that_fits(self):
+        full = self._render("full")
+        compact = self._render("compact")
+        minimal = self._render("minimal")
+        full_width = quota.visible_width(full)
+        compact_width = quota.visible_width(compact)
+        minimal_width = quota.visible_width(minimal)
+        self.assertGreater(full_width, compact_width + 100)
+        self.assertGreater(compact_width, minimal_width)
+        budgeted = {
+            full_width + 10: full,
+            full_width: full,
+            full_width - 1: compact,
+            compact_width: compact,
+            compact_width - 1: minimal,
+            minimal_width: minimal,
+            minimal_width - 1: minimal,
+            0: minimal,
+        }
+        for budget, expected in budgeted.items():
+            self.assertEqual(self._render("auto", max_width=budget), expected, budget)
+        self.assertEqual(self._render("auto", max_width=400), full)
+        self.assertEqual(self._render("auto"), compact)
+
+    def test_max_width_is_ignored_without_the_auto_layout(self):
+        for layout in ("full", "compact", "minimal"):
+            self.assertEqual(self._render(layout, max_width=1), self._render(layout))
+        self.assertEqual(self._render("compact", max_width=1000), self._render("compact"))
+
+    def test_visible_width_measures_tmux_cells(self):
+        self.assertEqual(quota.visible_width("#[fg=#c0caf5]ab#[default]"), 2)
+        self.assertEqual(quota.visible_width("⚡"), 2)
+        self.assertEqual(quota.visible_width("✦◈│·▁█%"), 7)
+        self.assertEqual(quota.visible_width(""), 0)
+        self.assertEqual(quota.visible_width(self._render("minimal")), 24)
+
+    def test_dense_layouts_reset_styles_and_never_emit_escapes(self):
+        for layout in ("compact", "minimal"):
+            for unicode_mode in (False, True):
+                text = self._render(layout, unicode=unicode_mode)
+                self.assertNotIn("\033[", text)
+                self.assertTrue(text.endswith("#[default]"))
+                self.assertGreaterEqual(text.count("#[default]"), text.count("#[fg="))
+
+    def test_tmux_command_and_cli_pass_layout_and_max_width(self):
+        command = quota.tmux_command(
+            Path("/tmp/path with spaces/tmux-quota.py"), use_unicode=True,
+            providers=self.ALL, layout="auto", max_width=60,
+        )
+        self.assertEqual(
+            command,
+            "#(python3 " + shlex.quote(str(Path("/tmp/path with spaces/tmux-quota.py").expanduser())) +
+            " --unicode --layout auto --max-width 60 --providers claude,codex,opencode-go)",
+        )
+        self.assertEqual(command, quota.tmux_command(
+            Path("/tmp/path with spaces/tmux-quota.py"), True, self.ALL, "auto", 60))
+        run = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command", "--unicode", "--layout", "auto",
+             "--max-width", "60", "--providers", "claude,codex,opencode-go"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(run.stdout.strip(), quota.tmux_command(SOURCE, True, self.ALL, "auto", 60))
+        default = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command"], check=True, capture_output=True,
+            text=True, timeout=5,
+        )
+        self.assertNotIn("--layout", default.stdout)
+        self.assertNotIn("--max-width", default.stdout)
+        compact_only = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command", "--layout", "compact"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        self.assertTrue(compact_only.stdout.strip().endswith(" --layout compact)"))
+        rejected = subprocess.run(
+            [sys.executable, str(SOURCE), "--layout", "dense"], capture_output=True, text=True,
+            timeout=5,
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("--layout", rejected.stderr)
+
+    def test_cli_runs_selected_layout_without_touching_the_default_call(self):
+        output = io.StringIO()
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as run_status, \
+             mock.patch.object(sys, "argv", [str(SOURCE), "--unicode"]), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(quota.main(), 0)
+        run_status.assert_called_once_with(True)
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as run_status, \
+             mock.patch.object(sys, "argv", [str(SOURCE), "--layout", "compact"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(quota.main(), 0)
+        run_status.assert_called_once_with(False, quota.DEFAULT_PROVIDERS, "compact", None, None)
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as run_status, \
+             mock.patch.object(sys, "argv", [str(SOURCE), "--layout", "auto", "--max-width", "60"]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(quota.main(), 0)
+        run_status.assert_called_once_with(False, quota.DEFAULT_PROVIDERS, "auto", 60, None)
 
 
 if __name__ == "__main__":

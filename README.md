@@ -101,7 +101,7 @@ Replace `/absolute/path/to` with the actual clone location. Start `tmux` to load
 
 The duplicate check reads the global option from the same tmux server. Checking `#{status-right}` instead can read a theme's session override and append duplicate global widgets when reloading inside CCB.
 
-When upgrading an existing setup, update the checkout first, then edit the existing helper command to add `--unicode`; the duplicate check intentionally keeps an existing command. Keep one helper invocation in `status-right`.
+When upgrading an existing setup, update the checkout first, then edit the existing helper command to add `--unicode`, `--layout`, or the new flags; the duplicate check intentionally keeps an existing command. Keep one helper invocation in `status-right`.
 
 For an installation path containing spaces, run this from the cloned repository to print a shell-quoted command fragment:
 
@@ -133,6 +133,26 @@ Unicode status-bar sample (filled bars use green below 50%, gold from 50% to 79%
 
 Tmux uses its native `#[...]` styles. The default ASCII bars remain available for minimal terminal fonts by omitting `--unicode`; the Unicode mode uses standard glyphs and does not require a Nerd Font. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
 
+Three opt-in layouts compress the same data for narrow status lines. Omitting `--layout` keeps the full output above, byte for byte, so existing configurations need no change. `--layout compact` drops the provider names, draws a one-cell gauge for each short window, and keeps the reset countdown for those windows and for any window at 80% or above. A window counts as short when its label starts with an hour or minute duration such as `5h` or `45m`, so Codex's `1h` window and Claude's `7d` or `7d opus` windows each get the right treatment:
+
+```text
+⚡ 5h ▁ 2% 4h53m · 7d 2%  │  ✦ 5h ▄ 47% 30m · 7d 20%  │  ◈ 5h ▁ 0% 4h50m · 7d 1% · mo 0%
+```
+
+The ASCII form of the same command stays entirely ASCII: `C`, `X`, and `O` identifiers, `|` between providers, `/` between a provider's windows, `...` for waiting data, and no gauge:
+
+```text
+C 5h 2% 4h53m / 7d 2%  |  X 5h 47% 30m / 7d 20%  |  O 5h 0% 4h50m / 7d 1% / mo 0%
+```
+
+`--layout minimal` reduces each provider to one percentage: the highest usage across that provider's windows, with a red `!` added when any of its windows is limited. `--layout auto` renders full, compact, and minimal in that order and keeps the first that fits the cells given by `--max-width`:
+
+```tmux
+set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --layout auto --max-width #{e|-:#{client_width},60})"
+```
+
+`--max-width` is the number of cells reserved for the quota text, so subtract your other status widgets before passing it; the `#{e|-:#{client_width},60}` form above subtracts 60 cells for the clock and the rest of the line, and tmux expands it per attached client. `--layout auto` without `--max-width` renders the compact layout, and `--max-width` is ignored by the explicit layouts. The layouts keep every state marker distinct: an inactive CLI shows only a dim icon, `…` (or `...` in ASCII) means waiting for data, `?` means unavailable, `~` marks stale data, and a limited window keeps a red percentage with a red `!`.
+
 Other tmux themes may replace `status-right` after this command is added. Use the theme's supported extension point, preserving its existing content. A reload guard must check the same option scope the theme changes: global or per-session. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
 
 ### CCB integration
@@ -149,7 +169,7 @@ set-option -g @ccb_status_right_extra "  #(python3 /absolute/path/to/agent-quota
 
 Reload with `tmux source-file ~/.tmux.conf`. A compatible active CCB theme reads the value live and displays the quotas after its clock. A per-session value overrides the global value. Assigning the option again on reload keeps one widget; if you already use this extension for other widgets, add the quota command once to that existing value. CCB restores the ordinary status when its launcher exits. Narrow terminals can still clip the combined status line.
 
-For paths with spaces, use the fragment printed by `python3 tmux-quota.py --tmux-command --unicode` inside the double-quoted option value, following the quoting guidance above. Literal percent signs in this option, including any in the command path, must be doubled as `%%` because CCB applies tmux time formatting. Percentages printed by the quota helper need no changes. Native `#[...]` styles and `#(...)` commands are supported.
+For paths with spaces, use the fragment printed by `python3 tmux-quota.py --tmux-command --unicode` inside the double-quoted option value, following the quoting guidance above. Literal percent signs in this option, including any in the command path, must be doubled as `%%` because CCB applies tmux time formatting. Percentages printed by the quota helper need no changes. Native `#[...]` styles and `#(...)` commands are supported. The `--layout` and `--max-width` flags of the standalone command work here unchanged; add them to the value, for example `--layout compact`.
 
 Do not edit CCB's installed theme scripts: its installer replaces them. If an older personal integration appends the quota through a hook or directly inside the theme, remove that extra append when switching to this option so the quota appears once. Check ordinary tmux, CCB activation, config reloads, and CCB exit after upgrading. This plugin uses the public extension and does not modify CCB's private restore state.
 
@@ -163,30 +183,24 @@ python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --provider
 
 The default invocation is unchanged (`claude,codex`). Providers that are not selected are not fetched and their credentials are not read. OpenCode Go shows three windows: `5h` (rolling), `7d` (weekly), and `mo` (monthly), each with its percentage, bar, and reset countdown. A window the service reports as rate limited keeps its percentage in the high/red colour with a `limited` marker. `not running`, `no key`, `no Go plan`, `syncing`, `unavailable`, and `stale` states match the other providers.
 
-Keep OpenCode Go in its own widget so a Go outage or a missing key cannot change the Claude and Codex display. This reload-safe form appends a second helper invocation exactly once:
+One status item renders all three providers, so a Go outage or a missing key cannot disturb the Claude and Codex part of the line. This reload-safe form appends the helper exactly once, using the compact layout so three providers fit a normal status line:
 
 ```tmux
-if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *opencode-go*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers opencode-go)"'
+if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *tmux-quota.py*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --layout compact --providers claude,codex,opencode-go --opencode-key-command \"your-secret-tool get opencode-go\")"'
 ```
 
-The helper reads the bearer token from the `OPENCODE_API_KEY` environment variable only; it never takes the key on the command line and never reads a credential file. Either export the variable for the tmux server, which makes it visible to every pane and program that server starts, or wrap the one helper invocation, which keeps the key out of the server environment but pays the wrapper's cost on every status refresh.
+Upgrading from the two-widget setup: the reload guard skips the append when `status-right` already contains a `tmux-quota.py` invocation, so adding this block to an existing configuration will not replace the line you already have. Delete the old standalone OpenCode Go widget and edit the existing helper command to the form above instead of adding a second one; if you use CCB, make the same edit to the value of `@ccb_status_right_extra` and reload with `tmux source-file ~/.tmux.conf`.
 
-To export it, do so before the server starts, because an already-running server keeps the environment it was started with; exporting the variable in a shell afterwards does not reach that server's status commands. Start or restart tmux from a shell that has it set:
+`--opencode-key-command` takes a command; the helper splits it into arguments and runs it without a shell, so pipelines, globbing, redirections, and `$VAR` expansion do not work. Keep the command in quotes, as above, so tmux and the status-line shell pass it as one argument. `python3 tmux-quota.py --tmux-command … --opencode-key-command 'your-secret-tool get opencode-go'` prints the same fragment with the quoting applied for you. The command runs only when the key is actually needed, meaning OpenCode Go is selected and running, the cached Go data is stale, and no refresh is already in flight. The command must print exactly one line, the key itself, optionally newline-terminated; leading or trailing whitespace, extra lines, and non-printable bytes are rejected. A rejected or failed lookup shows `no key` for OpenCode Go only and makes no network request; Claude and Codex keep rendering from their own caches.
+
+Set `OPENCODE_API_KEY` instead when you prefer the environment. A non-blank variable wins over the command, and an empty or whitespace-only variable counts as unset, so the command above still works when an empty variable is exported:
 
 ```sh
 export OPENCODE_API_KEY="$(your-secret-tool get opencode-go)"
 tmux new-session   # or restart the server
 ```
 
-On tmux 3.4, `tmux set-environment -g OPENCODE_API_KEY …` also reaches a running server's status `#()` jobs, which was checked with an attached client; the value stays in the server environment until `set-environment -gu OPENCODE_API_KEY`.
-
-To keep the key out of the server environment entirely, put the vault wrapper inside the status-right fragment itself, with `mcpctl` on the server's `PATH`. This keeps the same reload guard and still appends exactly one widget:
-
-```tmux
-if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *opencode-go*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(mcpctl exec-vault --env OPENCODE_API_KEY=opencode-go-api-main -- python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers opencode-go)"'
-```
-
-When the variable is missing the widget shows `no key` and makes no network request.
+Export it before the server starts, because an already-running server keeps the environment it was started with; exporting the variable in a shell afterwards does not reach that server's status commands. On tmux 3.4, `tmux set-environment -g OPENCODE_API_KEY …` also reaches a running server's status `#()` jobs, which was checked with an attached client; the value stays in the server environment until `set-environment -gu OPENCODE_API_KEY`. The environment variable is visible to every pane and program that server starts, which is why the command option exists. Neither form keeps the key on the command line or in a credential file, and the helper stores only usage data in its cache.
 
 The widget appears while any interactive Pi or OpenCode process is running on the tmux host, which is the same process check used for Claude and Codex. That only means one of those tools is open: it does not prove that the running Pi session is using OpenCode Go, and a Go key from a different workspace still reports that workspace's meters. A workspace without a Go subscription returns `no Go plan` rather than an error; rate limiting holds a longer retry delay and shows `syncing` when no safe cached meters are left.
 

@@ -164,17 +164,13 @@ To opt in, add the flag to the helper command you already have, in place, rather
 
 The layouts keep every state marker distinct: an inactive CLI shows only a dim icon and name, `…` (or `...` in ASCII) means waiting for data, `?` means unavailable, `~` marks stale data directly after the name (`Claude:~`), and a limited window keeps a red percentage with a red `!`.
 
-**Updating a running server.** Editing the guarded append line in `~/.tmux.conf` and reloading does not change the invocation already stored in `status-right`, because the guard skips the append while a `tmux-quota.py` command is present. Either update the live option once, or start a fresh server:
+**Updating a running server.** Editing the guarded append line in `~/.tmux.conf` and reloading does not change the invocation already stored in `status-right`, because the guard skips the append while a `tmux-quota.py` command is present. Update the live option once; this keeps every other status widget in place:
 
 ```sh
-# one-time live update; keeps every other status widget in place
 tmux set -g status-right "$(tmux show -gv status-right | sed 's|tmux-quota.py --unicode|tmux-quota.py --unicode --layout compact|')"
-
-# alternative: let the next server pick up the edited configuration
-tmux kill-server
 ```
 
-Run that update once: it appends the flag again on a second run. Check the result with `tmux show -gv status-right` before relying on it, and keep the matching edit in `~/.tmux.conf` so the next server starts in the same state. For CCB, the `@ccb_status_right_extra` value is read live, so changing it in the sourced file and reloading does take effect; edit that value instead of the `status-right` option.
+Run it once only; a second run adds the flag again. Check the result with `tmux show -gv status-right` before relying on it, and keep the matching edit in `~/.tmux.conf` so the next server starts in the same state. Alternatively, skip the live update: the edited configuration takes effect the next time a tmux server starts, after your current sessions have ended. For CCB, the `@ccb_status_right_extra` value is read live, so changing it in the sourced file and reloading does take effect; edit that value instead of the `status-right` option.
 
 Other tmux themes may replace `status-right` after this command is added. Use the theme's supported extension point, preserving its existing content. A reload guard must check the same option scope the theme changes: global or per-session. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
 

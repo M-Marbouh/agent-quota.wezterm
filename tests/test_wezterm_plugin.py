@@ -247,7 +247,7 @@ class WezTermPluginTests(unittest.TestCase):
         home = str(self.tmp / "oracle-home")
         Path(home).mkdir(exist_ok=True)
         runner = f"""
-import json, os, runpy, subprocess, sys, urllib.request
+import json, os, runpy, subprocess, sys, time, urllib.request
 from unittest import mock
 
 BODY = {body!r}
@@ -274,6 +274,7 @@ class Response:
 sys.argv = ["tmux-quota.py", "--json", "--providers", "opencode-go"]
 with mock.patch.object(subprocess, "run", fake_run), \\
      mock.patch.object(urllib.request, "urlopen", return_value=Response()), \\
+     mock.patch.object(time, "time", return_value={NOW!r}), \\
      mock.patch.dict(os.environ, {{"OPENCODE_API_KEY": {GO_KEY!r}, "HOME": {home!r}}}):
     runpy.run_path({str(TMUX_HELPER)!r}, run_name="__main__")
 """

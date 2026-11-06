@@ -815,10 +815,14 @@ def render_status(
     opencode_go: dict[str, Any] | None = None,
     layout: str = "full",
     max_width: int | None = None,
+    hide_inactive: bool = False,
 ) -> str:
     current = time.time() if now is None else now
     data = {"claude": claude, "codex": codex, "opencode-go": opencode_go or {}}
     selected = [name for name in PROVIDERS if name in providers]
+    if hide_inactive:
+        # A provider whose CLI is not running disappears before auto measures anything.
+        selected = [name for name in selected if states.get(name)]
     if layout not in LAYOUTS:
         layout = "full"
     if layout == "auto":
@@ -838,6 +842,7 @@ def run_status(
     layout: str = "full",
     max_width: int | None = None,
     key_command: str | None = None,
+    hide_inactive: bool = False,
 ) -> str:
     now = time.time()
     selected = tuple(name for name in PROVIDERS if name in providers)
@@ -870,6 +875,7 @@ def run_status(
         data.get("opencode-go"),
         layout,
         max_width,
+        hide_inactive,
     )
 
 
@@ -892,6 +898,7 @@ def tmux_command(
     layout: str = "full",
     max_width: int | None = None,
     key_command: str | None = None,
+    hide_inactive: bool = False,
 ) -> str:
     flags = []
     if use_unicode:
@@ -905,6 +912,8 @@ def tmux_command(
         flags.append("--providers " + shlex.quote(",".join(selected)))
     if key_command:
         flags.append("--opencode-key-command " + shlex.quote(key_command))
+    if hide_inactive:
+        flags.append("--hide-inactive")
     return (
         "#(python3 "
         + shlex.quote(str(path.resolve()))
@@ -942,6 +951,12 @@ def main() -> int:
         metavar="CMD",
         help="command whose first output line is the OpenCode Go key when OPENCODE_API_KEY is unset",
     )
+    parser.add_argument(
+        "--hide-inactive",
+        action="store_true",
+        help="hide providers whose CLI is not running; this detects running tools in a terminal, "
+        "not signed-in accounts or the model a session is using",
+    )
     args = parser.parse_args()
     try:
         selected = parse_providers(args.providers)
@@ -951,19 +966,21 @@ def main() -> int:
         if args.tmux_command:
             print(tmux_command(
                 Path(__file__), args.unicode, selected, args.layout, args.max_width,
-                args.opencode_key_command,
+                args.opencode_key_command, args.hide_inactive,
             ))
         elif (
             selected == DEFAULT_PROVIDERS
             and args.layout == "full"
             and args.max_width is None
             and not args.opencode_key_command
+            and not args.hide_inactive
         ):
             # The default path keeps its original single-argument call.
             print(run_status(args.unicode))
         else:
             print(run_status(
-                args.unicode, selected, args.layout, args.max_width, args.opencode_key_command
+                args.unicode, selected, args.layout, args.max_width, args.opencode_key_command,
+                args.hide_inactive,
             ))
     except Exception:
         print("#[fg=colour245]Quota unavailable#[default]")

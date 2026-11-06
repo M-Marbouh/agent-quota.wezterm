@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import itertools
 import io
 import json
 import math
@@ -1571,9 +1572,263 @@ class OpenCodeKeyCommandTests(unittest.TestCase):
              ), contextlib.redirect_stdout(output):
             self.assertEqual(quota.main(), 0)
         run_status.assert_called_once_with(
-            False, ("opencode-go",), "full", None, self.COMMAND
+            False, ("opencode-go",), "full", None, self.COMMAND, False
         )
         self.assertEqual(output.getvalue(), "STATUS\n")
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as default_run, \
+             mock.patch.object(sys, "argv", [str(SOURCE)]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(quota.main(), 0)
+        default_run.assert_called_once_with(False)
+
+
+class HideInactiveTests(unittest.TestCase):
+    """--hide-inactive drops providers whose CLI process is not running."""
+
+    NOW = 1793969150
+    ALL = ("claude", "codex", "opencode-go")
+    NAMES = {"claude": "Claude", "codex": "Codex", "opencode-go": "OpenCode Go"}
+    ICONS = {"claude": "⚡", "codex": "✦", "opencode-go": "◈"}
+    ASCII_ICONS = {"claude": "C", "codex": "X", "opencode-go": "O"}
+    CLAUDE = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 3.0, "reset_at": 1793986200.457986},
+        {"label": "7d", "percent": 3.0, "reset_at": 1794564000.458007},
+    ]}
+    CODEX = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 7.0, "reset_at": 1793987009.0},
+        {"label": "7d", "percent": 22.0, "reset_at": 1794506129.0},
+    ]}
+    GO = {"status": "ok", "windows": [
+        {"label": "5h", "percent": 0.0, "reset_at": 1793986584.0},
+        {"label": "7d", "percent": 1.0, "reset_at": 1794182400.0},
+        {"label": "mo", "percent": 0.0, "reset_at": 1796503387.0},
+    ]}
+
+    @staticmethod
+    def _plain(text):
+        return re.sub(r"#\[[^\]]*\]", "", text)
+
+    def _render(self, states, layout="full", *, unicode_mode=True, max_width=None,
+                hide_inactive=True, providers=None, claude=None, codex=None, go=None):
+        providers = self.ALL if providers is None else providers
+        return quota.render_status(
+            states,
+            self.CLAUDE if claude is None else claude,
+            self.CODEX if codex is None else codex,
+            self.NOW,
+            unicode_mode,
+            providers,
+            self.GO if go is None else go,
+            layout,
+            max_width,
+            hide_inactive,
+        )
+
+    def _activity_states(self):
+        for bits in itertools.product((True, False), repeat=3):
+            yield dict(zip(self.ALL, bits))
+
+    def test_only_running_providers_are_rendered_in_every_layout(self):
+        budgets = {"auto-wide": 400, "auto-tight": 40}
+        for states, unicode_mode in itertools.product(self._activity_states(), (True, False)):
+            active = [name for name in self.ALL if states[name]]
+            for layout, budget in (("full", None), ("compact", None), ("minimal", None),
+                                   ("auto", budgets["auto-wide"]), ("auto", budgets["auto-tight"])):
+                label = f"{layout}-{budget}" if budget is not None else layout
+                with self.subTest(activity=states, layout=label, unicode=unicode_mode):
+                    text = self._render(states, layout, unicode_mode=unicode_mode,
+                                        max_width=budget)
+                    visible = self._plain(text)
+                    for name in self.ALL:
+                        icon = self.ICONS[name] if unicode_mode else self.ASCII_ICONS[name]
+                        head = f"{icon} {self.NAMES[name]}:"
+                        if states[name]:
+                            self.assertIn(head, visible)
+                        else:
+                            self.assertNotIn(head, visible)
+                            self.assertNotIn(self.NAMES[name], visible)
+                    if not active:
+                        self.assertEqual(text, "")
+                        continue
+                    # Rebuild the expected line from one-provider renders of the same layout.
+                    chosen = layout
+                    if layout == "auto":
+                        chosen = next(
+                            candidate for candidate in ("full", "compact", "minimal")
+                            if self._render(states, candidate, unicode_mode=unicode_mode)
+                            == text
+                        )
+                        self.assertIn(chosen, ("full", "compact", "minimal"))
+                    parts = [
+                        self._render(states, chosen, unicode_mode=unicode_mode,
+                                     providers=(name,), claude=self.CLAUDE, codex=self.CODEX,
+                                     go=self.GO)
+                        for name in active
+                    ]
+                    separator = quota.layout_separator(chosen, unicode_mode)
+                    self.assertEqual(text, separator.join(parts))
+                    self.assertFalse(visible.startswith(separator.strip()))
+                    self.assertFalse(visible.endswith(separator.strip()))
+                    self.assertNotIn(separator.strip() + " " + separator.strip(), visible)
+
+    def test_omitting_the_flag_matches_head_bytes(self):
+        head_source = Path(tempfile.gettempdir()) / f"head-quota-hide-inactive-{os.getpid()}.py"
+        head_source.write_text(subprocess.run(
+            ["git", "show", "HEAD:tmux-quota.py"], cwd=str(SOURCE.parent),
+            capture_output=True, text=True, check=True,
+        ).stdout)
+        try:
+            spec = importlib.util.spec_from_file_location("head_quota_hide", head_source)
+            head = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(head)
+        finally:
+            head_source.unlink(missing_ok=True)
+        fixtures = [
+            (self.CLAUDE, self.CODEX, self.GO),
+            ({"status": "error", "windows": [{"label": "5h", "percent": 12}], "stale": True},
+             {"status": "ok", "windows": [{"label": "1h", "percent": 85, "reset_at": 1793970000}]},
+             {"status": "no_plan", "windows": []}),
+            ({"status": "not_running"}, {"status": "syncing", "windows": []},
+             {"status": "no_key", "windows": []}),
+        ]
+        layouts = [("full", None), ("compact", None), ("minimal", None),
+                   ("auto", 400), ("auto", 40), ("auto", None)]
+        checked = 0
+        for states, unicode_mode, (claude, codex, go) in itertools.product(
+            self._activity_states(), (True, False), fixtures
+        ):
+            for layout, budget in layouts:
+                with self.subTest(activity=states, layout=layout, budget=budget,
+                                  unicode=unicode_mode):
+                    new_text = quota.render_status(
+                        states, claude, codex, self.NOW, unicode_mode, self.ALL, go, layout, budget
+                    )
+                    old_text = head.render_status(
+                        states, claude, codex, self.NOW, unicode_mode, self.ALL, go, layout, budget
+                    )
+                    self.assertEqual(new_text, old_text)
+                    checked += 1
+        self.assertEqual(checked, 8 * 2 * 3 * 6)
+
+    def test_active_error_states_stay_visible_with_the_flag(self):
+        states = {"claude": True, "codex": True, "opencode-go": True}
+        shown = {
+            "no_key": {"status": "no_key", "windows": []},
+            "syncing": {"status": "syncing", "windows": []},
+            "rate_limited": {"status": "rate_limited", "windows": []},
+            "unavailable": {"status": "error", "windows": []},
+            "no_plan": {"status": "no_plan", "windows": []},
+            "stale": {"status": "error", "stale": True,
+                      "windows": [{"label": "5h", "percent": 12, "reset_at": 1794000000}]},
+        }
+        full_text = {
+            "no_key": "no key", "syncing": "syncing", "rate_limited": "syncing",
+            "unavailable": "unavailable", "no_plan": "no Go plan", "stale": "stale",
+        }
+        dense_text = {
+            "no_key": "no key", "syncing": "…", "rate_limited": "…",
+            "unavailable": "?", "no_plan": "no plan", "stale": "~",
+        }
+        for name, data in shown.items():
+            for layout in ("full", "compact", "minimal"):
+                with self.subTest(state=name, layout=layout):
+                    text = self._render(states, layout, claude=data, codex={}, go={},
+                                        providers=("claude",))
+                    expected = dense_text[name] if layout != "full" else full_text[name]
+                    self.assertNotEqual(text, "")
+                    self.assertIn("Claude:", self._plain(text))
+                    self.assertIn(expected, self._plain(text))
+        ascii_states = self._render(states, "compact", unicode_mode=False,
+                                    claude=shown["no_key"], codex=shown["no_key"],
+                                    go=shown["no_key"])
+        self.assertEqual(self._plain(ascii_states),
+                         "C Claude: no key  |  X Codex: no key  |  O OpenCode Go: no key")
+
+    def test_inactive_providers_fetch_nothing_and_read_no_credentials(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(quota, "process_states", return_value={
+                 "claude": False, "codex": False, "opencode-go": False,
+             }), \
+             mock.patch.object(quota, "cache_dir", return_value=Path(directory)), \
+             mock.patch.object(quota, "fetch_claude") as fetch_claude, \
+             mock.patch.object(quota, "fetch_codex") as fetch_codex, \
+             mock.patch.object(quota, "fetch_opencode_go") as fetch_opencode_go, \
+             mock.patch.object(quota, "read_claude_token") as read_claude_token, \
+             mock.patch.object(quota.subprocess, "run") as run, \
+             mock.patch.object(quota.urllib.request, "urlopen") as urlopen, \
+             mock.patch.object(quota.time, "time", return_value=1):
+            text = quota.run_status(
+                True, self.ALL, "full", None, "secret-tool get opencode-go", True
+            )
+            leftovers = {path.name for path in Path(directory).iterdir()}
+        self.assertEqual(text, "")
+        fetch_claude.assert_not_called()
+        fetch_codex.assert_not_called()
+        fetch_opencode_go.assert_not_called()
+        read_claude_token.assert_not_called()
+        run.assert_not_called()
+        urlopen.assert_not_called()
+        self.assertEqual(leftovers, set())
+
+    def test_all_inactive_leaves_an_empty_status_line(self):
+        states = {"claude": False, "codex": False, "opencode-go": False}
+        for layout in ("full", "compact", "minimal", "auto"):
+            for unicode_mode in (True, False):
+                with self.subTest(layout=layout, unicode=unicode_mode):
+                    self.assertEqual(
+                        self._render(states, layout, unicode_mode=unicode_mode, max_width=80), ""
+                    )
+        partly = {"claude": False, "codex": True, "opencode-go": False}
+        self.assertEqual(self._plain(self._render(partly, "minimal")), "✦ Codex: 22%")
+
+    def test_hidden_providers_do_not_inflate_auto_measurements(self):
+        all_active = {"claude": True, "codex": True, "opencode-go": True}
+        wide_width = quota.visible_width(
+            self._render(all_active, "full", hide_inactive=False)
+        )
+        compact_width = quota.visible_width(
+            self._render(all_active, "compact", hide_inactive=False)
+        )
+        only_go = {"claude": False, "codex": False, "opencode-go": True}
+        go_full = self._render(only_go, "full")
+        go_compact = self._render(only_go, "compact")
+        go_minimal = self._render(only_go, "minimal")
+        compact_width_go = quota.visible_width(go_compact)
+        self.assertEqual(quota.visible_width(go_full), 91)
+        self.assertEqual(compact_width_go, 44)
+        self.assertEqual(quota.visible_width(go_minimal), 17)
+        # Only the surviving provider is measured, so a small budget keeps it visible.
+        self.assertEqual(self._render(only_go, "auto", max_width=91), go_full)
+        self.assertEqual(self._render(only_go, "auto", max_width=compact_width_go), go_compact)
+        self.assertEqual(
+            self._render(only_go, "auto", max_width=compact_width_go - 1), go_minimal
+        )
+        self.assertLess(compact_width, wide_width)
+
+    def test_cli_and_generator_carry_the_flag(self):
+        command = quota.tmux_command(
+            SOURCE, use_unicode=True, providers=self.ALL,
+            layout="compact", max_width=None, key_command=None, hide_inactive=True,
+        )
+        self.assertIn("--layout compact", command)
+        self.assertTrue(command.endswith("--hide-inactive)"))
+        self.assertNotIn("--hide-inactive", quota.tmux_command(SOURCE))
+        round_trip = subprocess.run(
+            [sys.executable, str(SOURCE), "--tmux-command", "--unicode", "--layout", "compact",
+             "--providers", "claude,codex,opencode-go", "--hide-inactive"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(round_trip.stdout.strip(), command)
+        argv = shlex.split(round_trip.stdout.strip().removeprefix("#(").removesuffix(")"))
+        self.assertEqual(argv[0], "python3")
+        self.assertIn("--hide-inactive", argv)
+        with mock.patch.object(quota, "run_status", return_value="STATUS") as run_status, \
+             mock.patch.object(sys, "argv", argv[1:]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(quota.main(), 0)
+        run_status.assert_called_once_with(
+            True, self.ALL, "compact", None, None, True
+        )
         with mock.patch.object(quota, "run_status", return_value="STATUS") as default_run, \
              mock.patch.object(sys, "argv", [str(SOURCE)]), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -2019,12 +2274,12 @@ class LayoutTests(unittest.TestCase):
              mock.patch.object(sys, "argv", [str(SOURCE), "--layout", "compact"]), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(quota.main(), 0)
-        run_status.assert_called_once_with(False, quota.DEFAULT_PROVIDERS, "compact", None, None)
+        run_status.assert_called_once_with(False, quota.DEFAULT_PROVIDERS, "compact", None, None, False)
         with mock.patch.object(quota, "run_status", return_value="STATUS") as run_status, \
              mock.patch.object(sys, "argv", [str(SOURCE), "--layout", "auto", "--max-width", "60"]), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(quota.main(), 0)
-        run_status.assert_called_once_with(False, quota.DEFAULT_PROVIDERS, "auto", 60, None)
+        run_status.assert_called_once_with(False, quota.DEFAULT_PROVIDERS, "auto", 60, None, False)
 
 
 if __name__ == "__main__":

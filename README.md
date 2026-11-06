@@ -131,7 +131,7 @@ Unicode status-bar sample (filled bars use green below 50%, gold from 50% to 79%
 ⚡ Claude: 5h ███░░░░░ 42% (2h31m) · 7d █░░░░░░░ 18% (4d12h) · ✦ Codex: 5h ███████░ 88% (2h10m) · 7d ███░░░░░ 32% (1d4h)
 ```
 
-Tmux uses its native `#[...]` styles. The default ASCII bars remain available for minimal terminal fonts by omitting `--unicode`; the Unicode mode uses standard glyphs and does not require a Nerd Font. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
+Tmux uses its native `#[...]` styles. The default ASCII bars remain available for minimal terminal fonts by omitting `--unicode`; the Unicode mode uses standard glyphs and does not require a Nerd Font. Each provider is fetched and cached independently; inactive CLIs show `not running` (or disappear with [`--hide-inactive`](#hiding-inactive-providers)), temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
 
 #### Compact layout
 
@@ -171,6 +171,16 @@ tmux set -g status-right "$(tmux show -gv status-right | sed 's|tmux-quota.py --
 ```
 
 Run it once only; a second run adds the flag again. Check the result with `tmux show -gv status-right` before relying on it, and keep the matching edit in `~/.tmux.conf` so the next server starts in the same state. Alternatively, skip the live update: the edited configuration takes effect the next time a tmux server starts, after your current sessions have ended. For CCB, the `@ccb_status_right_extra` value is read live, so changing it in the sourced file and reloading does take effect; edit that value instead of the `status-right` option.
+
+#### Hiding inactive providers
+
+`--hide-inactive` omits providers whose CLI is not running, in every layout and in both Unicode and ASCII output, and leaves the separators correct so nothing is left dangling:
+
+```text
+✦ Codex: 5h ▇ 78% 3h57m · 7d 34%  │  ◈ OpenCode Go: 5h ▁ 0% 3h50m · 7d 1% · mo 0%
+```
+
+This detects running tools on the tmux host, not connected accounts: Claude counts as running only while a `claude` process runs in a terminal, Codex only while `codex` runs, and OpenCode Go whenever a `pi` or `opencode` TUI is open, even when that session is not using OpenCode Go. A hidden provider is also never fetched, so no credential file is read and no key command runs for it. A provider that *is* running but has no usable data still renders its state (`no key`, `syncing`, `unavailable`, `no plan`, or `~` on stale data). When every selected provider is inactive the widget renders nothing at all, which keeps the status line clean. Check what would be hidden by running the helper once with the flag before adding it to your configuration; `python3 tmux-quota.py --tmux-command --hide-inactive` prints the fragment for you.
 
 Other tmux themes may replace `status-right` after this command is added. Use the theme's supported extension point, preserving its existing content. A reload guard must check the same option scope the theme changes: global or per-session. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
 

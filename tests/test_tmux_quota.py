@@ -1666,33 +1666,48 @@ class LayoutTests(unittest.TestCase):
                     checked += 1
         self.assertEqual(checked, 40)
 
-    def test_compact_sample_renders_without_provider_names(self):
+    def test_compact_sample_keeps_provider_names(self):
         text = self._render("compact", claude=self.SAMPLE_CLAUDE, codex=self.SAMPLE_CODEX)
         self.assertEqual(
             self._plain(text),
-            "⚡ 5h ▁ 2% 4h53m · 7d 2%  │  ✦ 5h ▄ 47% 30m · 7d 20%  │  ◈ 5h ▁ 0% 4h50m · 7d 1% · mo 0%",
+            "⚡ Claude: 5h ▁ 2% 4h53m · 7d 2%  │  ✦ Codex: 5h ▄ 47% 30m · 7d 20%"
+            "  │  ◈ OpenCode Go: 5h ▁ 0% 4h50m · 7d 1% · mo 0%",
         )
-        self.assertEqual(quota.visible_width(text), 88)
+        self.assertEqual(quota.visible_width(text), 116)
+        for icon, name in (("⚡", "Claude:"), ("✦", "Codex:"), ("◈", "OpenCode Go:")):
+            self.assertIn(f"#[fg=#c0caf5]{icon} {name}#[default]", text)
+        minimal = self._render("minimal", claude=self.SAMPLE_CLAUDE, codex=self.SAMPLE_CODEX)
+        self.assertEqual(
+            self._plain(minimal), "⚡ Claude: 2%  │  ✦ Codex: 47%  │  ◈ OpenCode Go: 1%"
+        )
+        self.assertEqual(quota.visible_width(minimal), 52)
 
     def test_compact_never_silently_falls_back_to_full(self):
         compact = self._render("compact")
         full = self._render("full")
-        for name in ("Claude", "Codex", "OpenCode Go"):
-            self.assertNotIn(name, compact)
+        # Both layouts name providers now, so compare structure and width, not names.
+        for name in ("Claude:", "Codex:", "OpenCode Go:"):
+            self.assertIn(name, compact)
             self.assertIn(name, full)
-        self.assertNotIn("░", compact)
-        self.assertNotIn("█", compact)
-        self.assertNotIn("(", compact)
-        self.assertNotIn(")", compact)
-        self.assertLess(quota.visible_width(compact), quota.visible_width(full) - 100)
+        visible = self._plain(compact)
+        self.assertNotIn("░", visible)
+        self.assertNotIn("█", visible)
+        self.assertIsNone(re.search(r"\[[#-]{8}\]", visible))
+        self.assertNotIn("(", visible)
+        self.assertNotIn(")", visible)
+        compact_width = quota.visible_width(compact)
+        full_width = quota.visible_width(full)
+        self.assertGreater(full_width - compact_width, 80)
         self.assertNotEqual(self._plain(compact), self._plain(full))
+        self.assertNotEqual(compact, full)
 
     def test_compact_ascii_uses_identifiers_and_no_gauge(self):
         text = self._render("compact", unicode=False, claude=self.SAMPLE_CLAUDE,
                             codex=self.SAMPLE_CODEX)
         self.assertEqual(
             self._plain(text),
-            "C 5h 2% 4h53m / 7d 2%  |  X 5h 47% 30m / 7d 20%  |  O 5h 0% 4h50m / 7d 1% / mo 0%",
+            "C Claude: 5h 2% 4h53m / 7d 2%  |  X Codex: 5h 47% 30m / 7d 20%"
+            "  |  O OpenCode Go: 5h 0% 4h50m / 7d 1% / mo 0%",
         )
         for glyph in quota.GAUGE_GLYPHS:
             self.assertNotIn(glyph, text)
@@ -1726,7 +1741,7 @@ class LayoutTests(unittest.TestCase):
         ]}
         limited = self._render("compact", provider_set=("claude",), claude=stale_free, codex={}, go={})
         self.assertIn("#[fg=#f7768e]21%!#[default]", limited)
-        self.assertEqual(self._plain(limited), "⚡ 5h ▂ 21%! 4h53m · 7d 20%")
+        self.assertEqual(self._plain(limited), "⚡ Claude: 5h ▂ 21%! 4h53m · 7d 20%")
 
     def test_short_windows_are_chosen_by_label_not_position(self):
         self.assertTrue(quota.is_short_window("5h"))
@@ -1745,8 +1760,8 @@ class LayoutTests(unittest.TestCase):
             {"label": "mo", "percent": 10.0, "reset_at": 1796503387},
         ]}
         for label, data, expected in (
-            ("weekly only", weekly_only, "◈ 7d 10%"),
-            ("monthly only", monthly_only, "◈ mo 10%"),
+            ("weekly only", weekly_only, "◈ OpenCode Go: 7d 10%"),
+            ("monthly only", monthly_only, "◈ OpenCode Go: mo 10%"),
         ):
             with self.subTest(case=label):
                 text = self._render("compact", provider_set=("opencode-go",), claude={},
@@ -1759,20 +1774,20 @@ class LayoutTests(unittest.TestCase):
             {"label": "7d", "percent": 20.0, "reset_at": 1794506129},
         ]}
         text = self._render("compact", provider_set=("codex",), claude={}, codex=mixed, go={})
-        self.assertEqual(self._plain(text), "✦ 1h ▁ 10% 30m · 7d 20%")
+        self.assertEqual(self._plain(text), "✦ Codex: 1h ▁ 10% 30m · 7d 20%")
         self.assertEqual(text.count("▁"), 1)
         suffixed = {"status": "ok", "windows": [
             {"label": "7d opus", "percent": 10.0, "reset_at": 1794564000},
         ]}
         text = self._render("compact", provider_set=("claude",), claude=suffixed, codex={}, go={})
-        self.assertEqual(self._plain(text), "⚡ 7d opus 10%")
+        self.assertEqual(self._plain(text), "⚡ Claude: 7d opus 10%")
         for glyph in quota.GAUGE_GLYPHS:
             self.assertNotIn(glyph, text)
         long_at_85 = {"status": "ok", "windows": [
             {"label": "7d", "percent": 85.0, "reset_at": 1794564000},
         ]}
         text = self._render("compact", provider_set=("claude",), claude=long_at_85, codex={}, go={})
-        self.assertEqual(self._plain(text), "⚡ 7d 85% 6d21h")
+        self.assertEqual(self._plain(text), "⚡ Claude: 7d 85% 6d21h")
 
     def test_short_window_gauge_and_countdown_survive_a_long_first_window(self):
         windows = {"status": "ok", "windows": [
@@ -1780,7 +1795,7 @@ class LayoutTests(unittest.TestCase):
             {"label": "5h", "percent": 10.0, "reset_at": 1793970950},
         ]}
         text = self._render("compact", provider_set=("claude",), claude=windows, codex={}, go={})
-        self.assertEqual(self._plain(text), "⚡ 7d 20% · 5h ▁ 10% 30m")
+        self.assertEqual(self._plain(text), "⚡ Claude: 7d 20% · 5h ▁ 10% 30m")
         self.assertEqual(text.count("▁"), 1)
 
     def test_dense_ascii_output_stays_ascii_only(self):
@@ -1823,11 +1838,11 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(self._plain(self._render("compact", unicode=False,
                                                  provider_set=("claude",),
                                                  claude={"status": "syncing", "windows": []},
-                                                 codex={}, go={})), "C ...")
+                                                 codex={}, go={})), "C Claude: ...")
         self.assertEqual(self._plain(self._render("minimal", unicode=False,
                                                  provider_set=("claude",),
                                                  claude={"status": "rate_limited", "windows": []},
-                                                 codex={}, go={})), "C ...")
+                                                 codex={}, go={})), "C Claude: ...")
 
     def test_gauge_level_boundaries(self):
         self.assertEqual(quota.gauge_cell(0), "▁")
@@ -1848,26 +1863,26 @@ class LayoutTests(unittest.TestCase):
             {"label": "7d", "percent": 95.0, "reset_at": 1794564000},
         ]}
         text = self._render("minimal", provider_set=("claude",), claude=claude, codex={}, go={})
-        self.assertEqual(self._plain(text), "⚡ 95%!")
-        self.assertEqual(text, "#[fg=#c0caf5]⚡#[default] #[fg=#f7768e]95%!#[default]")
+        self.assertEqual(self._plain(text), "⚡ Claude: 95%!")
+        self.assertEqual(text, "#[fg=#c0caf5]⚡ Claude:#[default] #[fg=#f7768e]95%!#[default]")
         healthy = {"status": "ok", "windows": [
             {"label": "5h", "percent": 5.0}, {"label": "7d", "percent": 95.0},
         ]}
         plain_healthy = self._render("minimal", provider_set=("claude",), claude=healthy,
                                      codex={}, go={})
-        self.assertEqual(plain_healthy, "#[fg=#c0caf5]⚡#[default] #[fg=#f7768e]95%#[default]")
+        self.assertEqual(plain_healthy, "#[fg=#c0caf5]⚡ Claude:#[default] #[fg=#f7768e]95%#[default]")
         mid = {"status": "ok", "windows": [{"label": "5h", "percent": 42.0}]}
         self.assertEqual(
             self._render("minimal", provider_set=("claude",), claude=mid, codex={}, go={}),
-            "#[fg=#c0caf5]⚡#[default] #[fg=#9ece6a]42%#[default]",
+            "#[fg=#c0caf5]⚡ Claude:#[default] #[fg=#9ece6a]42%#[default]",
         )
 
     def test_minimal_uses_highest_percent_without_countdown(self):
         text = self._render("minimal")
-        self.assertEqual(self._plain(text), "⚡ 3%  │  ✦ 22%  │  ◈ 1%")
-        self.assertNotIn("d", self._plain(text).replace("│", ""))
+        self.assertEqual(self._plain(text), "⚡ Claude: 3%  │  ✦ Codex: 22%  │  ◈ OpenCode Go: 1%")
+        self.assertIsNone(re.search(r"\d+[dh]\d*", self._plain(text)))
         ascii_text = self._render("minimal", unicode=False)
-        self.assertEqual(self._plain(ascii_text), "C 3%  |  X 22%  |  O 1%")
+        self.assertEqual(self._plain(ascii_text), "C Claude: 3%  |  X Codex: 22%  |  O OpenCode Go: 1%")
 
     def test_state_markers_are_distinct_in_compact_and_minimal(self):
         markers = {
@@ -1879,12 +1894,12 @@ class LayoutTests(unittest.TestCase):
             "unavailable": {"status": "error", "windows": []},
         }
         expected = {
-            "not_running": "⚡",
-            "syncing": "⚡ …",
-            "rate_limited": "⚡ …",
-            "no_plan": "⚡ no plan",
-            "no_key": "⚡ no key",
-            "unavailable": "⚡ ?",
+            "not_running": "⚡ Claude:",
+            "syncing": "⚡ Claude: …",
+            "rate_limited": "⚡ Claude: …",
+            "no_plan": "⚡ Claude: no plan",
+            "no_key": "⚡ Claude: no key",
+            "unavailable": "⚡ Claude: ?",
         }
         for layout in ("compact", "minimal"):
             seen = set()
@@ -1893,25 +1908,25 @@ class LayoutTests(unittest.TestCase):
                 self.assertEqual(self._plain(text), expected[name], name)
                 self.assertTrue(text.endswith("#[default]"))
                 seen.add(self._plain(text))
-            self.assertIn("⚡", seen)
+            self.assertIn("⚡ Claude:", seen)
             self.assertEqual(len(seen), len(markers) - 1)
         dim_idle = self._render("compact", provider_set=("claude",),
                                 claude={"status": "not_running"}, codex={}, go={})
-        self.assertEqual(dim_idle, "#[fg=#565f89]⚡#[default]")
+        self.assertEqual(dim_idle, "#[fg=#565f89]⚡ Claude:#[default]")
         stale_compact = self._render(
             "compact", provider_set=("claude",),
             claude={"status": "error", "windows": [{"label": "5h", "percent": 12,
                                                     "reset_at": 1794000000}], "stale": True},
             codex={}, go={},
         )
-        self.assertEqual(self._plain(stale_compact), "⚡~ 5h ▁ 12% 8h34m")
+        self.assertEqual(self._plain(stale_compact), "⚡ Claude:~ 5h ▁ 12% 8h34m")
         self.assertIn("#[fg=#e0af68]~#[default]", stale_compact)
         stale_minimal = self._render(
             "minimal", provider_set=("claude",),
             claude={"status": "error", "windows": [{"label": "5h", "percent": 12}], "display_state": "stale"},
             codex={}, go={},
         )
-        self.assertEqual(self._plain(stale_minimal), "⚡~ 12%")
+        self.assertEqual(self._plain(stale_minimal), "⚡ Claude:~ 12%")
 
     def test_auto_picks_the_first_layout_that_fits(self):
         full = self._render("full")
@@ -1947,7 +1962,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(quota.visible_width("⚡"), 2)
         self.assertEqual(quota.visible_width("✦◈│·▁█%"), 7)
         self.assertEqual(quota.visible_width(""), 0)
-        self.assertEqual(quota.visible_width(self._render("minimal")), 24)
+        self.assertEqual(quota.visible_width(self._render("minimal")), 52)
 
     def test_dense_layouts_reset_styles_and_never_emit_escapes(self):
         for layout in ("compact", "minimal"):

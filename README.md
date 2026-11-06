@@ -89,7 +89,7 @@ git clone https://github.com/M-Marbouh/agent-quota.wezterm.git
 cd agent-quota.wezterm
 ```
 
-Keep `tmux-quota.py` and `codex-limits.py` together in the checkout. Add the following to `~/.tmux.conf`, replacing the path with your clone location. It preserves existing `status-right` content and avoids duplicate appends on reload. The example enables `--unicode` icons and block bars on a readable dark background; omit that flag for the default ASCII output:
+Keep `tmux-quota.py` and `codex-limits.py` together in the checkout. Add the following to `~/.tmux.conf`, replacing the path with your clone location. It preserves existing `status-right` content and avoids duplicate appends on reload. The example enables `--unicode` icons and block bars on a readable dark background; omit that flag for the default ASCII output. This is the default full layout: no `--layout` flag is needed, and the [compact layout](#compact-layout) is opt-in:
 
 ```tmux
 set-option -g status-style 'bg=#1e1e2e,fg=#cdd6f4'
@@ -133,25 +133,48 @@ Unicode status-bar sample (filled bars use green below 50%, gold from 50% to 79%
 
 Tmux uses its native `#[...]` styles. The default ASCII bars remain available for minimal terminal fonts by omitting `--unicode`; the Unicode mode uses standard glyphs and does not require a Nerd Font. Each provider is fetched and cached independently; inactive CLIs show `not running`, temporary failures show a stale marker when safe cached data remains, and data past a reset is discarded until a fresh read succeeds.
 
-Three opt-in layouts compress the same data for narrow status lines. Omitting `--layout` keeps the full output above, byte for byte, so existing configurations need no change. `--layout compact` drops the provider names, draws a one-cell gauge for each short window, and keeps the reset countdown for those windows and for any window at 80% or above. A window counts as short when its label starts with an hour or minute duration such as `5h` or `45m`, so Codex's `1h` window and Claude's `7d` or `7d opus` windows each get the right treatment:
+#### Compact layout
+
+The full layout above is the default and needs no flag. Three opt-in layouts compress the same data when a status line is too narrow, and all of them keep the provider names and every state marker:
 
 ```text
-⚡ 5h ▁ 2% 4h53m · 7d 2%  │  ✦ 5h ▄ 47% 30m · 7d 20%  │  ◈ 5h ▁ 0% 4h50m · 7d 1% · mo 0%
+⚡ Claude: 5h ▁ 2% 4h53m · 7d 2%  │  ✦ Codex: 5h ▄ 47% 30m · 7d 20%  │  ◈ OpenCode Go: 5h ▁ 0% 4h50m · 7d 1% · mo 0%
 ```
 
-The ASCII form of the same command stays entirely ASCII: `C`, `X`, and `O` identifiers, `|` between providers, `/` between a provider's windows, `...` for waiting data, and no gauge:
+`--layout compact` replaces the eight-cell bars with a one-cell gauge for each short window and keeps the reset countdown for those windows and for any window at 80% or above. A window counts as short when its label starts with an hour or minute duration such as `5h` or `45m`, so Codex's `1h` window and Claude's `7d` or `7d opus` windows each get the right treatment. The ASCII form stays entirely ASCII: `C`, `X`, and `O` identifiers, `|` between providers, `/` between a provider's windows, `...` for waiting data, and no gauge:
 
 ```text
-C 5h 2% 4h53m / 7d 2%  |  X 5h 47% 30m / 7d 20%  |  O 5h 0% 4h50m / 7d 1% / mo 0%
+C Claude: 5h 2% 4h53m / 7d 2%  |  X Codex: 5h 47% 30m / 7d 20%  |  O OpenCode Go: 5h 0% 4h50m / 7d 1% / mo 0%
 ```
 
-`--layout minimal` reduces each provider to one percentage: the highest usage across that provider's windows, with a red `!` added when any of its windows is limited. `--layout auto` renders full, compact, and minimal in that order and keeps the first that fits the cells given by `--max-width`:
+`--layout minimal` reduces each provider to one percentage: the highest usage across that provider's windows, with a red `!` added when any of its windows is limited:
+
+```text
+⚡ Claude: 2%  │  ✦ Codex: 47%  │  ◈ OpenCode Go: 1%
+C Claude: 2%  |  X Codex: 47%  |  O OpenCode Go: 1%
+```
+
+To opt in, add the flag to the helper command you already have, in place, rather than adding a second helper. `--layout auto` renders full, compact, and minimal in that order and keeps the first that fits the cells given by `--max-width`; the helper fragment then reads:
 
 ```tmux
-set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --layout auto --max-width #{e|-:#{client_width},60})"
+#(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --layout auto --max-width #{e|-:#{client_width},60})
 ```
 
-`--max-width` is the number of cells reserved for the quota text, so subtract your other status widgets before passing it; the `#{e|-:#{client_width},60}` form above subtracts 60 cells for the clock and the rest of the line, and tmux expands it per attached client. `--layout auto` without `--max-width` renders the compact layout, and `--max-width` is ignored by the explicit layouts. The layouts keep every state marker distinct: an inactive CLI shows only a dim icon, `…` (or `...` in ASCII) means waiting for data, `?` means unavailable, `~` marks stale data, and a limited window keeps a red percentage with a red `!`.
+`--max-width` is the number of cells reserved for the quota text, so subtract your other status widgets before passing it; the `#{e|-:#{client_width},60}` form subtracts 60 cells for the clock and the rest of the line, and tmux expands it per attached client. `--layout auto` without `--max-width` renders the compact layout, and `--max-width` is ignored by the explicit layouts. At a typical 212-column client the three layouts need roughly 220 cells for full, 117 for compact, and 52 for minimal.
+
+The layouts keep every state marker distinct: an inactive CLI shows only a dim icon and name, `…` (or `...` in ASCII) means waiting for data, `?` means unavailable, `~` marks stale data directly after the name (`Claude:~`), and a limited window keeps a red percentage with a red `!`.
+
+**Updating a running server.** Editing the guarded append line in `~/.tmux.conf` and reloading does not change the invocation already stored in `status-right`, because the guard skips the append while a `tmux-quota.py` command is present. Either update the live option once, or start a fresh server:
+
+```sh
+# one-time live update; keeps every other status widget in place
+tmux set -g status-right "$(tmux show -gv status-right | sed 's|tmux-quota.py --unicode|tmux-quota.py --unicode --layout compact|')"
+
+# alternative: let the next server pick up the edited configuration
+tmux kill-server
+```
+
+Run that update once: it appends the flag again on a second run. Check the result with `tmux show -gv status-right` before relying on it, and keep the matching edit in `~/.tmux.conf` so the next server starts in the same state. For CCB, the `@ccb_status_right_extra` value is read live, so changing it in the sourced file and reloading does take effect; edit that value instead of the `status-right` option.
 
 Other tmux themes may replace `status-right` after this command is added. Use the theme's supported extension point, preserving its existing content. A reload guard must check the same option scope the theme changes: global or per-session. Increase `status-right-length` if the bar is clipped; the needed width depends on your other widgets and terminal size.
 
@@ -169,7 +192,7 @@ set-option -g @ccb_status_right_extra "  #(python3 /absolute/path/to/agent-quota
 
 Reload with `tmux source-file ~/.tmux.conf`. A compatible active CCB theme reads the value live and displays the quotas after its clock. A per-session value overrides the global value. Assigning the option again on reload keeps one widget; if you already use this extension for other widgets, add the quota command once to that existing value. CCB restores the ordinary status when its launcher exits. Narrow terminals can still clip the combined status line.
 
-For paths with spaces, use the fragment printed by `python3 tmux-quota.py --tmux-command --unicode` inside the double-quoted option value, following the quoting guidance above. Literal percent signs in this option, including any in the command path, must be doubled as `%%` because CCB applies tmux time formatting. Percentages printed by the quota helper need no changes. Native `#[...]` styles and `#(...)` commands are supported. The `--layout` and `--max-width` flags of the standalone command work here unchanged; add them to the value, for example `--layout compact`.
+For paths with spaces, use the fragment printed by `python3 tmux-quota.py --tmux-command --unicode` inside the double-quoted option value, following the quoting guidance above. Literal percent signs in this option, including any in the command path, must be doubled as `%%` because CCB applies tmux time formatting. Percentages printed by the quota helper need no changes. Native `#[...]` styles and `#(...)` commands are supported. The `--layout` and `--max-width` flags of the standalone command work here unchanged; add them to the value as the [compact layout](#compact-layout) section describes.
 
 Do not edit CCB's installed theme scripts: its installer replaces them. If an older personal integration appends the quota through a hook or directly inside the theme, remove that extra append when switching to this option so the quota appears once. Check ordinary tmux, CCB activation, config reloads, and CCB exit after upgrading. This plugin uses the public extension and does not modify CCB's private restore state.
 
@@ -183,13 +206,13 @@ python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --provider
 
 The default invocation is unchanged (`claude,codex`). Providers that are not selected are not fetched and their credentials are not read. OpenCode Go shows three windows: `5h` (rolling), `7d` (weekly), and `mo` (monthly), each with its percentage, bar, and reset countdown. A window the service reports as rate limited keeps its percentage in the high/red colour with a `limited` marker. `not running`, `no key`, `no Go plan`, `syncing`, `unavailable`, and `stale` states match the other providers.
 
-One status item renders all three providers, so a Go outage or a missing key cannot disturb the Claude and Codex part of the line. This reload-safe form appends the helper exactly once, using the compact layout so three providers fit a normal status line:
+One status item renders all three providers, so a Go outage or a missing key cannot disturb the Claude and Codex part of the line. This reload-safe form appends the helper exactly once and uses the default full layout; switch to `--layout compact` as described in the [compact layout](#compact-layout) section when the full line does not fit:
 
 ```tmux
-if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *tmux-quota.py*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --layout compact --providers claude,codex,opencode-go --opencode-key-command \"your-secret-tool get opencode-go\")"'
+if-shell 'case "$(tmux -S "#{socket_path}" show-option -gqv status-right)" in *tmux-quota.py*) exit 0;; *) exit 1;; esac' '' 'set-option -ag status-right "  #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --providers claude,codex,opencode-go --opencode-key-command \"your-secret-tool get opencode-go\")"'
 ```
 
-Upgrading from the two-widget setup: the reload guard skips the append when `status-right` already contains a `tmux-quota.py` invocation, so adding this block to an existing configuration will not replace the line you already have. Delete the old standalone OpenCode Go widget and edit the existing helper command to the form above instead of adding a second one; if you use CCB, make the same edit to the value of `@ccb_status_right_extra` and reload with `tmux source-file ~/.tmux.conf`.
+Upgrading from the two-widget setup: the reload guard skips the append when `status-right` already contains a `tmux-quota.py` invocation, so adding this block to an existing configuration will not replace the line you already have. Delete the old standalone OpenCode Go widget and edit the existing helper command to the form above instead of adding a second one, using the one-time live update or a fresh server described in the [compact layout](#compact-layout) section; if you use CCB, make the same edit to the value of `@ccb_status_right_extra` and reload with `tmux source-file ~/.tmux.conf`.
 
 `--opencode-key-command` takes a command; the helper splits it into arguments and runs it without a shell, so pipelines, globbing, redirections, and `$VAR` expansion do not work. Keep the command in quotes, as above, so tmux and the status-line shell pass it as one argument. `python3 tmux-quota.py --tmux-command … --opencode-key-command 'your-secret-tool get opencode-go'` prints the same fragment with the quoting applied for you. The command runs only when the key is actually needed, meaning OpenCode Go is selected and running, the cached Go data is stale, and no refresh is already in flight. The command must print exactly one line, the key itself, optionally newline-terminated; leading or trailing whitespace, extra lines, and non-printable bytes are rejected. A rejected or failed lookup shows `no key` for OpenCode Go only and makes no network request; Claude and Codex keep rendering from their own caches.
 

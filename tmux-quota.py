@@ -713,12 +713,13 @@ def state_marker(data: dict[str, Any], use_unicode: bool) -> str | None:
 def dense_provider_head(
     name: str, data: dict[str, Any], use_unicode: bool, colors: dict[str, str]
 ) -> tuple[str, str | None]:
-    """Icon head, plus the complete state suffix when no usage windows are drawn."""
+    """Icon and provider name, plus the state suffix when no usage windows are drawn."""
     icon = (UNICODE_ICONS if use_unicode else ASCII_ICONS).get(name, "\u2726" if use_unicode else "?")
+    prefix = f"{icon} {name}:"
     marker = state_marker(data, use_unicode)
     if marker == "":
-        return f"#[fg={colors['dim']}]{icon}#[default]", ""
-    head = f"#[fg={colors['state']}]{icon}#[default]"
+        return f"#[fg={colors['dim']}]{prefix}#[default]", ""
+    head = f"#[fg={colors['state']}]{prefix}#[default]"
     if data.get("stale") or data.get("display_state") == "stale":
         head += f"#[fg={colors['stale']}]~#[default]"
     if marker is None:

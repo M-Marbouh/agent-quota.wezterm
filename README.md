@@ -141,13 +141,13 @@ Tmux uses its native `#[...]` styles. The default ASCII bars remain available fo
 The full layout above is the default and needs no flag. Three opt-in layouts compress the same data when a status line is too narrow, and all of them keep the provider names and every state marker:
 
 ```text
-⚡ Claude: 5h ▁ 2% 4h53m · 7d 2%  │  ✦ Codex: 5h ▄ 47% 30m · 7d 20%  │  ◈ OpenCode Go: 5h ▁ 0% 4h50m · 7d 1% · mo 0%
+⚡ Claude: 5h ▁ 2% 4h53m · 7d 2% 6d21h  │  ✦ Codex: 5h ▄ 47% 30m · 7d 20% 6d5h  │  ◈ OpenCode Go: 5h ▁ 0% 4h50m · 7d 1% 2d11h · mo 0% 29d7h
 ```
 
-`--layout compact` replaces the eight-cell bars with a one-cell gauge for each short window and keeps the reset countdown for those windows and for any window at 80% or above. A window counts as short when its label starts with an hour or minute duration such as `5h` or `45m`, so Codex's `1h` window and Claude's `7d` or `7d opus` windows each get the right treatment. The ASCII form stays entirely ASCII: `C`, `X`, and `O` identifiers, `|` between providers, `/` between a provider's windows, `...` for waiting data, and no gauge:
+`--layout compact` replaces the eight-cell bars with a one-cell gauge for each short window and keeps the reset countdown on every window. A window counts as short when its label starts with an hour or minute duration such as `5h` or `45m`, so Codex's `1h` window and Claude's `7d` or `7d opus` windows each get the right treatment. The ASCII form stays entirely ASCII: `C`, `X`, and `O` identifiers, `|` between providers, `/` between a provider's windows, `...` for waiting data, and no gauge:
 
 ```text
-C Claude: 5h 2% 4h53m / 7d 2%  |  X Codex: 5h 47% 30m / 7d 20%  |  O OpenCode Go: 5h 0% 4h50m / 7d 1% / mo 0%
+C Claude: 5h 2% 4h53m / 7d 2% 6d21h  |  X Codex: 5h 47% 30m / 7d 20% 6d5h  |  O OpenCode Go: 5h 0% 4h50m / 7d 1% 2d11h / mo 0% 29d7h
 ```
 
 `--layout minimal` reduces each provider to one percentage: the highest usage across that provider's windows, with a red `!` added when any of its windows is limited:
@@ -163,7 +163,7 @@ To opt in, add the flag to the helper command you already have, in place, rather
 #(python3 /absolute/path/to/agent-quota.wezterm/tmux-quota.py --unicode --layout auto --max-width #{e|-:#{client_width},60})
 ```
 
-`--max-width` is the number of cells reserved for the quota text, so subtract your other status widgets before passing it; the `#{e|-:#{client_width},60}` form subtracts 60 cells for the clock and the rest of the line, and tmux expands it per attached client. `--layout auto` without `--max-width` renders the compact layout, and `--max-width` is ignored by the explicit layouts. At a typical 212-column client the three layouts need roughly 220 cells for full, 117 for compact, and 52 for minimal.
+`--max-width` is the number of cells reserved for the quota text, so subtract your other status widgets before passing it; the `#{e|-:#{client_width},60}` form subtracts 60 cells for the clock and the rest of the line, and tmux expands it per attached client. `--layout auto` without `--max-width` renders the compact layout, and `--max-width` is ignored by the explicit layouts. At a typical 212-column client the three layouts need roughly 220 cells for full, 140 for compact, and 52 for minimal.
 
 The layouts keep every state marker distinct: an inactive CLI shows only a dim icon and name, `…` (or `...` in ASCII) means waiting for data, `?` means unavailable, `~` marks stale data directly after the name (`Claude:~`), and a limited window keeps a red percentage with a red `!`.
 
@@ -324,7 +324,7 @@ quota.apply_to_config(config, {
 })
 ```
 
-`layout = "compact"` and `layout = "minimal"` mirror the tmux dense layouts: an `icon Name:` head, a one-cell gauge and countdown for short windows such as `5h`, percentage only for long windows with the countdown kept when a window is at `80%` or more or rate limited, and the highest percentage plus a red `!` in the minimal layout. `~` after the colon marks stale data, an inactive CLI keeps only its dim name, and the other states read `…`, `?`, `no key`, `no plan` or `ready`. Windows are joined with ` · ` and providers with a dim `│`. `layout = nil` and `layout = "full"` keep the bar-and-countdown rendering above; `compact = true` still means "hide the countdowns" in those layouts. There is no `auto` layout in WezTerm.
+`layout = "compact"` and `layout = "minimal"` mirror the tmux dense layouts: an `icon Name:` head, a one-cell gauge for short windows such as `5h`, a reset countdown on every window, and the highest percentage plus a red `!` in the minimal layout. `~` after the colon marks stale data, an inactive CLI keeps only its dim name, and the other states read `…`, `?`, `no key`, `no plan` or `ready`. Windows are joined with ` · ` and providers with a dim `│`. `layout = nil` and `layout = "full"` keep the bar-and-countdown rendering above; `compact = true` still means "hide the countdowns" in those layouts. There is no `auto` layout in WezTerm.
 
 `hide_inactive = true` drops providers whose CLI is not running, so a closed Claude or Codex session disappears instead of showing `not running`; separators stay clean and the line is empty when nothing is active. OpenCode Go counts as inactive when the helper reports `not_running`.
 

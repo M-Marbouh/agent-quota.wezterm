@@ -361,6 +361,23 @@ with mock.patch.object(subprocess, "run", fake_run), \\
 
     # -- dense layouts ---------------------------------------------------
 
+    def test_compact_layout_keeps_every_countdown(self):
+        lua, module = self.load(opts=self.opts(layout="compact"))
+        self.prime_codex(CODEX_OK)
+        text = plain(self.build(lua, module, CLAUDE_OK))
+        self.assertIn("7d 3% 2d11h", text)  # long window, well under 80%
+        self.assertIn("7d 22% 4h00m", text)
+
+    def test_compact_layout_omits_a_countdown_it_cannot_compute(self):
+        lua, module = self.load(opts=self.opts(layout="compact"))
+        self.prime_codex(CODEX_OK)
+        no_reset = {
+            "five_hour": CLAUDE_OK["five_hour"],
+            "seven_day": {"utilization": 3},
+        }
+        text = plain(self.build(lua, module, no_reset))
+        self.assertRegex(text, r"7d 3%(?! \d)")
+
     def test_dense_layouts_render_go_from_the_real_json_output(self):
         self.go_stdout = self.real_go_stdout()
         parsed = json.loads(self.go_stdout)

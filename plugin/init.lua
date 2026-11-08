@@ -1514,7 +1514,7 @@ local function dense_window(window, now)
   parts[#parts + 1] = pct_color .. string.format("%.0f%%", percent) .. marker .. RESET
 
   local remaining = countdown_unix(window.reset_at, now)
-  if remaining and (short or window.limited or percent >= 80) then
+  if remaining then
     parts[#parts + 1] = DIM .. remaining .. RESET
   end
   return table.concat(parts, " ")

@@ -2193,7 +2193,11 @@ class HideInactiveTests(unittest.TestCase):
         if baseline.returncode != 0 or not baseline.stdout:
             self.skipTest(f"baseline commit {self.BASELINE_COMMIT} is not available here")
         head_source = Path(tempfile.gettempdir()) / f"head-quota-hide-inactive-{os.getpid()}.py"
-        head_source.write_text(baseline.stdout)
+        # The compact layout later began showing every countdown; only that intended
+        # change is applied to the baseline, so hide-inactive stays compared byte for byte.
+        old_rule = "if remaining and (short or limited or percent >= 80):"
+        self.assertEqual(baseline.stdout.count(old_rule), 1)
+        head_source.write_text(baseline.stdout.replace(old_rule, "if remaining:"))
         try:
             spec = importlib.util.spec_from_file_location("head_quota_hide", head_source)
             head = importlib.util.module_from_spec(spec)
@@ -2312,7 +2316,7 @@ class HideInactiveTests(unittest.TestCase):
         go_minimal = self._render(only_go, "minimal")
         compact_width_go = quota.visible_width(go_compact)
         self.assertEqual(quota.visible_width(go_full), 91)
-        self.assertEqual(compact_width_go, 44)
+        self.assertEqual(compact_width_go, 56)
         self.assertEqual(quota.visible_width(go_minimal), 17)
         # Only the surviving provider is measured, so a small budget keeps it visible.
         self.assertEqual(self._render(only_go, "auto", max_width=91), go_full)
@@ -2442,10 +2446,10 @@ class LayoutTests(unittest.TestCase):
         text = self._render("compact", claude=self.SAMPLE_CLAUDE, codex=self.SAMPLE_CODEX)
         self.assertEqual(
             self._plain(text),
-            "⚡ Claude: 5h ▁ 2% 4h53m · 7d 2%  │  ✦ Codex: 5h ▄ 47% 30m · 7d 20%"
-            "  │  ◈ OpenCode Go: 5h ▁ 0% 4h50m · 7d 1% · mo 0%",
+            "⚡ Claude: 5h ▁ 2% 4h53m · 7d 2% 6d21h  │  ✦ Codex: 5h ▄ 47% 30m · 7d 20% 6d5h"
+            "  │  ◈ OpenCode Go: 5h ▁ 0% 4h50m · 7d 1% 2d11h · mo 0% 29d7h",
         )
-        self.assertEqual(quota.visible_width(text), 116)
+        self.assertEqual(quota.visible_width(text), 139)
         for icon, name in (("⚡", "Claude:"), ("✦", "Codex:"), ("◈", "OpenCode Go:")):
             self.assertIn(f"#[fg=#c0caf5]{icon} {name}#[default]", text)
         minimal = self._render("minimal", claude=self.SAMPLE_CLAUDE, codex=self.SAMPLE_CODEX)
@@ -2469,7 +2473,7 @@ class LayoutTests(unittest.TestCase):
         self.assertNotIn(")", visible)
         compact_width = quota.visible_width(compact)
         full_width = quota.visible_width(full)
-        self.assertGreater(full_width - compact_width, 80)
+        self.assertGreater(full_width - compact_width, 70)
         self.assertNotEqual(self._plain(compact), self._plain(full))
         self.assertNotEqual(compact, full)
 
@@ -2478,8 +2482,8 @@ class LayoutTests(unittest.TestCase):
                             codex=self.SAMPLE_CODEX)
         self.assertEqual(
             self._plain(text),
-            "C Claude: 5h 2% 4h53m / 7d 2%  |  X Codex: 5h 47% 30m / 7d 20%"
-            "  |  O OpenCode Go: 5h 0% 4h50m / 7d 1% / mo 0%",
+            "C Claude: 5h 2% 4h53m / 7d 2% 6d21h  |  X Codex: 5h 47% 30m / 7d 20% 6d5h"
+            "  |  O OpenCode Go: 5h 0% 4h50m / 7d 1% 2d11h / mo 0% 29d7h",
         )
         for glyph in quota.GAUGE_GLYPHS:
             self.assertNotIn(glyph, text)
@@ -2497,10 +2501,9 @@ class LayoutTests(unittest.TestCase):
         text = self._render("compact", provider_set=("claude", "codex"), claude=claude, codex=codex)
         plain = self._plain(text)
         self.assertIn("5h ▁ 10% 4h53m", plain)
-        self.assertIn("7d 79%", plain)
-        self.assertNotIn("7d 79% 58d", plain)
+        self.assertIn("7d 79% 6d21h", plain)
         self.assertIn("1h ▇ 85% 30m", plain)
-        self.assertIn("30d 20%", plain)
+        self.assertIn("30d 20% 6d5h", plain)
         for fragment in (
             "#[fg=#9ece6a]▁#[default] #[fg=#9ece6a]10%#[default]",
             "#[fg=#e0af68]79%#[default]",
@@ -2513,7 +2516,7 @@ class LayoutTests(unittest.TestCase):
         ]}
         limited = self._render("compact", provider_set=("claude",), claude=stale_free, codex={}, go={})
         self.assertIn("#[fg=#f7768e]21%!#[default]", limited)
-        self.assertEqual(self._plain(limited), "⚡ Claude: 5h ▂ 21%! 4h53m · 7d 20%")
+        self.assertEqual(self._plain(limited), "⚡ Claude: 5h ▂ 21%! 4h53m · 7d 20% 6d21h")
 
     def test_short_windows_are_chosen_by_label_not_position(self):
         self.assertTrue(quota.is_short_window("5h"))
@@ -2532,8 +2535,8 @@ class LayoutTests(unittest.TestCase):
             {"label": "mo", "percent": 10.0, "reset_at": 1796503387},
         ]}
         for label, data, expected in (
-            ("weekly only", weekly_only, "◈ OpenCode Go: 7d 10%"),
-            ("monthly only", monthly_only, "◈ OpenCode Go: mo 10%"),
+            ("weekly only", weekly_only, "◈ OpenCode Go: 7d 10% 6d21h"),
+            ("monthly only", monthly_only, "◈ OpenCode Go: mo 10% 29d7h"),
         ):
             with self.subTest(case=label):
                 text = self._render("compact", provider_set=("opencode-go",), claude={},
@@ -2546,13 +2549,13 @@ class LayoutTests(unittest.TestCase):
             {"label": "7d", "percent": 20.0, "reset_at": 1794506129},
         ]}
         text = self._render("compact", provider_set=("codex",), claude={}, codex=mixed, go={})
-        self.assertEqual(self._plain(text), "✦ Codex: 1h ▁ 10% 30m · 7d 20%")
+        self.assertEqual(self._plain(text), "✦ Codex: 1h ▁ 10% 30m · 7d 20% 6d5h")
         self.assertEqual(text.count("▁"), 1)
         suffixed = {"status": "ok", "windows": [
             {"label": "7d opus", "percent": 10.0, "reset_at": 1794564000},
         ]}
         text = self._render("compact", provider_set=("claude",), claude=suffixed, codex={}, go={})
-        self.assertEqual(self._plain(text), "⚡ Claude: 7d opus 10%")
+        self.assertEqual(self._plain(text), "⚡ Claude: 7d opus 10% 6d21h")
         for glyph in quota.GAUGE_GLYPHS:
             self.assertNotIn(glyph, text)
         long_at_85 = {"status": "ok", "windows": [
@@ -2567,7 +2570,7 @@ class LayoutTests(unittest.TestCase):
             {"label": "5h", "percent": 10.0, "reset_at": 1793970950},
         ]}
         text = self._render("compact", provider_set=("claude",), claude=windows, codex={}, go={})
-        self.assertEqual(self._plain(text), "⚡ Claude: 7d 20% · 5h ▁ 10% 30m")
+        self.assertEqual(self._plain(text), "⚡ Claude: 7d 20% 6d21h · 5h ▁ 10% 30m")
         self.assertEqual(text.count("▁"), 1)
 
     def test_dense_ascii_output_stays_ascii_only(self):
@@ -2707,7 +2710,7 @@ class LayoutTests(unittest.TestCase):
         full_width = quota.visible_width(full)
         compact_width = quota.visible_width(compact)
         minimal_width = quota.visible_width(minimal)
-        self.assertGreater(full_width, compact_width + 100)
+        self.assertGreater(full_width, compact_width + 70)
         self.assertGreater(compact_width, minimal_width)
         budgeted = {
             full_width + 10: full,

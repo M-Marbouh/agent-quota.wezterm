@@ -787,7 +787,7 @@ def compact_window(
         parts.append(f"#[fg={gauge_color}]{gauge_cell(percent)}#[default]")
     parts.append(f"#[fg={percent_color}]{percent:.0f}%{marker}#[default]")
     remaining = countdown(window.get("reset_at"), now)
-    if remaining and (short or limited or percent >= 80):
+    if remaining:
         parts.append(f"#[fg={colors['timer']}]{remaining}#[default]")
     return " ".join(parts)
 
